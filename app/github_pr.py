@@ -292,31 +292,83 @@ def get_file_content(
     return content, data["sha"]
 
 
-def update_file_content(
+def _get_branch_head_sha(ref: PullRequestRef, branch: str, headers: dict[str, str], base: str) -> str:
+    resp = requests.get(f"{base}/git/ref/heads/{branch}", headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["object"]["sha"]
+
+
+def _get_commit_tree_sha(commit_sha: str, headers: dict[str, str], base: str) -> str:
+    resp = requests.get(f"{base}/git/commits/{commit_sha}", headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["tree"]["sha"]
+
+
+def _create_blob(content: str, headers: dict[str, str], base: str) -> str:
+    resp = requests.post(
+        f"{base}/git/blobs",
+        headers=headers,
+        json={"content": content, "encoding": "utf-8"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["sha"]
+
+
+def commit_multiple_files(
     ref: PullRequestRef,
-    path: str,
     branch: str,
-    new_content: str,
-    sha: str,
+    files: dict[str, str],
     message: str,
     token: str = "",
 ) -> dict[str, Any]:
-    """Commit `new_content` to `path` on `branch` via the Contents API."""
+    """Commit changes to several files on `branch` as a single atomic commit,
+    via the Git Data API (blob + tree + commit + ref update), so a batch of
+    queued fixes lands as one push instead of one commit per file."""
+    if not files:
+        raise ValueError("No files to commit.")
     headers = _headers(token)
     base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
-    encoded = base64.b64encode(new_content.encode("utf-8")).decode("ascii")
-    resp = requests.put(
-        f"{base}/contents/{path}",
+
+    head_sha = _get_branch_head_sha(ref, branch, headers, base)
+    base_tree_sha = _get_commit_tree_sha(head_sha, headers, base)
+
+    tree_entries = [
+        {"path": path, "mode": "100644", "type": "blob", "sha": _create_blob(content, headers, base)}
+        for path, content in files.items()
+    ]
+
+    tree_resp = requests.post(
+        f"{base}/git/trees",
         headers=headers,
-        json={"message": message, "content": encoded, "sha": sha, "branch": branch},
-        timeout=60,
+        json={"base_tree": base_tree_sha, "tree": tree_entries},
+        timeout=30,
     )
-    if resp.status_code == 409:
+    tree_resp.raise_for_status()
+    new_tree_sha = tree_resp.json()["sha"]
+
+    commit_resp = requests.post(
+        f"{base}/git/commits",
+        headers=headers,
+        json={"message": message, "tree": new_tree_sha, "parents": [head_sha]},
+        timeout=30,
+    )
+    commit_resp.raise_for_status()
+    new_commit_sha = commit_resp.json()["sha"]
+
+    ref_resp = requests.patch(
+        f"{base}/git/refs/heads/{branch}",
+        headers=headers,
+        json={"sha": new_commit_sha, "force": False},
+        timeout=30,
+    )
+    if ref_resp.status_code in (409, 422):
         raise RuntimeError(
-            f"{path} changed on GitHub since it was read (stale sha). Re-run the check and retry."
+            f"{branch} moved on GitHub since the fixes were drafted (non-fast-forward). "
+            "Re-run the bot check and retry."
         )
-    resp.raise_for_status()
-    return resp.json()
+    ref_resp.raise_for_status()
+    return commit_resp.json()
 
 
 def post_issue_comment(ref: PullRequestRef, body: str, token: str = "") -> dict[str, Any]:

@@ -18,7 +18,7 @@ from app import load_config, save_config
 from app.auth_status_store import clear_auth_status, load_auth_status, save_auth_status
 from app.bot_review import (
     BotFinding,
-    apply_bot_fix,
+    apply_bot_fixes_batch,
     post_bot_reply,
     run_bot_comment_check,
 )
@@ -284,7 +284,8 @@ class PromptEditorDialog(tk.Toplevel):
 
 
 class BotReviewDialog(tk.Toplevel):
-    """Shows CodeRabbit / Amazon Q findings with per-item apply/reply actions."""
+    """Shows CodeRabbit / Amazon Q findings. Fixable findings get a checkbox
+    to queue them; queued fixes are pushed as a single commit via Apply all."""
 
     def __init__(
         self,
@@ -297,20 +298,27 @@ class BotReviewDialog(tk.Toplevel):
         super().__init__(master)
         self.diff = diff
         self.token = token
+        self._findings = list(findings)
+        self._queue_vars: dict[int, tk.BooleanVar] = {}
+        self._reply_widgets: dict[int, tk.Text] = {}
+        self._card_state: dict[int, dict] = {}
         self.title(f"Bot comments — {diff.ref.full_name}#{diff.ref.number}")
         self.resizable(True, True)
         self.transient(master)
-        self.geometry("880x640")
+        self.geometry("880x680")
 
         header = ttk.Frame(self, padding=(12, 12, 12, 4))
         header.pack(fill=tk.X)
         valid_count = sum(1 for f in findings if f.verdict.valid)
+        fixable_count = sum(1 for f in findings if f.verdict.valid and f.verdict.fixes)
         ttk.Label(
             header,
             text=(
                 f"{diff.title}\n"
                 f"{len(findings)} bot comment(s) found — {valid_count} judged valid, "
-                f"{len(findings) - valid_count} judged not valid."
+                f"{len(findings) - valid_count} judged not valid, "
+                f"{fixable_count} with a proposed fix.\n"
+                "Check the fixes you want, then Apply all pushes them as one commit."
             ),
             justify=tk.LEFT,
         ).pack(anchor="w")
@@ -338,6 +346,16 @@ class BotReviewDialog(tk.Toplevel):
 
         for finding in findings:
             self._build_card(inner, finding)
+
+        if fixable_count:
+            bottom_bar = ttk.Frame(self, padding=(12, 0, 12, 4))
+            bottom_bar.pack(fill=tk.X)
+            self.apply_all_status_var = tk.StringVar(value="")
+            ttk.Label(bottom_bar, textvariable=self.apply_all_status_var).pack(side=tk.LEFT)
+            self.apply_all_btn = ttk.Button(
+                bottom_bar, text="Apply all", state=tk.DISABLED, command=self._apply_all
+            )
+            self.apply_all_btn.pack(side=tk.RIGHT)
 
         ttk.Button(self, text="Close", command=self.destroy).pack(pady=(0, 10))
 
@@ -375,6 +393,15 @@ class BotReviewDialog(tk.Toplevel):
             anchor="w", pady=(2, 6)
         )
 
+        if verdict.valid and not verdict.fixes and verdict.fix_unavailable_reason:
+            ttk.Label(
+                card,
+                text=verdict.fix_unavailable_reason,
+                foreground="#9a6700",
+                wraplength=760,
+                justify=tk.LEFT,
+            ).pack(anchor="w", pady=(0, 6))
+
         original = ttk.LabelFrame(card, text="Original bot comment", padding=6)
         original.pack(fill=tk.X, pady=(0, 6))
         body = comment.body.strip() or "(empty)"
@@ -385,24 +412,26 @@ class BotReviewDialog(tk.Toplevel):
         original_text.configure(state=tk.DISABLED)
         original_frame.pack(fill=tk.BOTH, expand=True)
 
-        has_fix = verdict.valid and bool(verdict.fix_file) and verdict.fix_content is not None
+        has_fix = verdict.valid and bool(verdict.fixes)
         if has_fix:
-            fix_box = ttk.LabelFrame(card, text=f"Proposed fix — {verdict.fix_file}", padding=6)
-            fix_box.pack(fill=tk.X, pady=(0, 6))
-            lines = verdict.fix_content.splitlines()
-            shown_lines = lines[:30]
-            shown = "\n".join(shown_lines)
-            if len(lines) > 30:
-                shown += f"\n… ({len(lines) - 30} more lines)"
-            fix_text = tk.Text(
-                fix_box,
-                height=min(16, max(4, len(shown_lines) + 1)),
-                wrap=tk.NONE,
-                font=("Consolas", 9),
-            )
-            fix_text.insert("1.0", shown)
-            fix_text.configure(state=tk.DISABLED)
-            fix_text.pack(fill=tk.X)
+            for fix in verdict.fixes:
+                fix_box = ttk.LabelFrame(card, text=f"Proposed fix — {fix.path}", padding=6)
+                fix_box.pack(fill=tk.X, pady=(0, 6))
+                diff_text = fix.diff_text or "(no textual difference detected)"
+                lines = diff_text.splitlines()
+                shown_lines = lines[:60]
+                shown = "\n".join(shown_lines)
+                if len(lines) > 60:
+                    shown += f"\n… ({len(lines) - 60} more lines)"
+                fix_text = tk.Text(
+                    fix_box,
+                    height=min(20, max(4, len(shown_lines) + 1)),
+                    wrap=tk.NONE,
+                    font=("Consolas", 9),
+                )
+                fix_text.insert("1.0", shown)
+                fix_text.configure(state=tk.DISABLED)
+                fix_text.pack(fill=tk.X)
 
         reply_box = ttk.LabelFrame(card, text="Reply to post (edit before sending)", padding=6)
         reply_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
@@ -418,13 +447,18 @@ class BotReviewDialog(tk.Toplevel):
         action_row.pack(fill=tk.X, pady=(4, 0))
 
         if has_fix:
-            apply_btn = ttk.Button(action_row, text="Apply fix + reply")
-            apply_btn.configure(
-                command=lambda f=finding, b=apply_btn, s=status_var, w=reply_widget: self._apply_fix(
-                    f, b, s, w
-                )
+            file_note = "1 file" if len(verdict.fixes) == 1 else f"{len(verdict.fixes)} files"
+            queue_var = tk.BooleanVar(value=False)
+            check = ttk.Checkbutton(
+                action_row,
+                text=f"Queue this fix ({file_note}) for Apply all",
+                variable=queue_var,
+                command=self._update_apply_all_state,
             )
-            apply_btn.pack(side=tk.LEFT)
+            check.pack(side=tk.LEFT)
+            self._queue_vars[id(finding)] = queue_var
+            self._reply_widgets[id(finding)] = reply_widget
+            self._card_state[id(finding)] = {"check": check, "status_var": status_var}
         else:
             reply_btn = ttk.Button(action_row, text="Post reply")
             reply_btn.configure(
@@ -441,34 +475,106 @@ class BotReviewDialog(tk.Toplevel):
             link.pack(anchor="w", pady=(4, 0))
             link.bind("<Button-1>", lambda _e, u=comment.html_url: webbrowser.open(u))
 
-    def _apply_fix(
-        self,
-        finding: BotFinding,
-        button: ttk.Button,
-        status_var: tk.StringVar,
-        reply_widget: tk.Text,
-    ) -> None:
-        reply_text = reply_widget.get("1.0", "end-1c").strip()
-        if not reply_text:
-            messagebox.showerror("Missing reply", "The reply text can't be empty.", parent=self)
+    def _update_apply_all_state(self) -> None:
+        n = sum(1 for var in self._queue_vars.values() if var.get())
+        if n == 0:
+            self.apply_all_btn.configure(state=tk.DISABLED, text="Apply all")
+        else:
+            self.apply_all_btn.configure(state=tk.NORMAL, text=f"Apply all ({n}) as one commit")
+
+    def _apply_all(self) -> None:
+        selected = [
+            f
+            for f in self._findings
+            if id(f) in self._queue_vars and self._queue_vars[id(f)].get()
+        ]
+        if not selected:
             return
-        finding.verdict.reply_text = reply_text
-        button.configure(state=tk.DISABLED)
-        status_var.set("Applying…")
+
+        for finding in selected:
+            reply_widget = self._reply_widgets[id(finding)]
+            reply_text = reply_widget.get("1.0", "end-1c").strip()
+            if not reply_text:
+                messagebox.showerror(
+                    "Missing reply",
+                    f"The reply text for the {finding.comment.source} comment on "
+                    f"{finding.comment.path or 'the PR'} can't be empty.",
+                    parent=self,
+                )
+                return
+            finding.verdict.reply_text = reply_text
+
+        file_count = sum(len(f.verdict.fixes) for f in selected)
+        if not messagebox.askyesno(
+            "Apply all",
+            f"Apply {len(selected)} fix(es) across {file_count} file(s) as one commit to "
+            f"{self.diff.head_branch}, then post {len(selected)} reply(ies)?\n\n"
+            "This pushes directly to the PR branch and can't be undone from here.",
+            parent=self,
+        ):
+            return
+
+        self.apply_all_btn.configure(state=tk.DISABLED)
+        self.apply_all_status_var.set("Applying…")
+        for finding in selected:
+            state = self._card_state[id(finding)]
+            state["check"].configure(state=tk.DISABLED)
+            state["status_var"].set("Queued…")
 
         def worker() -> None:
             try:
-                apply_bot_fix(self.diff, finding, self.token)
-                post_bot_reply(self.diff, finding, self.token)
-                self.after(
-                    0,
-                    lambda: self._card_action_succeeded(reply_widget, status_var, "Applied + replied ✓"),
-                )
+                apply_bot_fixes_batch(self.diff, selected, self.token)
+                self.after(0, lambda: self._batch_commit_succeeded(selected))
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
-                self.after(0, lambda e=err: self._card_action_failed(button, status_var, e))
+                self.after(0, lambda e=err: self._batch_failed(selected, e))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _batch_commit_succeeded(self, findings: list[BotFinding]) -> None:
+        self.apply_all_status_var.set("Committed — posting replies…")
+        for finding in findings:
+            self._card_state[id(finding)]["status_var"].set("Committed — posting reply…")
+
+        def worker() -> None:
+            results: list[tuple[BotFinding, str | None]] = []
+            for finding in findings:
+                try:
+                    post_bot_reply(self.diff, finding, self.token)
+                    results.append((finding, None))
+                except Exception as exc:  # noqa: BLE001
+                    results.append((finding, str(exc)))
+            self.after(0, lambda: self._batch_replies_done(results))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _batch_replies_done(self, results: list[tuple[BotFinding, str | None]]) -> None:
+        failures = []
+        for finding, error in results:
+            state = self._card_state[id(finding)]
+            reply_widget = self._reply_widgets[id(finding)]
+            if error:
+                state["status_var"].set("Committed, reply failed")
+                failures.append(f"{finding.comment.source} ({finding.comment.path or 'PR'}): {error}")
+            else:
+                state["status_var"].set("Applied + replied ✓")
+                reply_widget.configure(state=tk.DISABLED)
+        self.apply_all_status_var.set("Done" if not failures else "Done, with reply failures")
+        if failures:
+            messagebox.showerror(
+                "Some replies failed to post",
+                "Code changes were committed, but these replies failed:\n\n" + "\n".join(failures),
+                parent=self,
+            )
+
+    def _batch_failed(self, findings: list[BotFinding], error: str) -> None:
+        for finding in findings:
+            state = self._card_state[id(finding)]
+            state["check"].configure(state=tk.NORMAL)
+            state["status_var"].set("")
+        self.apply_all_status_var.set("")
+        self._update_apply_all_state()
+        messagebox.showerror("Apply all failed", error, parent=self)
 
     def _post_reply(
         self,
