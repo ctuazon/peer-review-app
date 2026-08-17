@@ -1,6 +1,7 @@
 """Fetch pull request metadata and diffs from GitHub."""
 from __future__ import annotations
 
+import base64
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -228,3 +229,116 @@ def summarize_diff_for_prompt(diff: PullRequestDiff, max_chars: int = 120_000) -
     if remaining > 0 and len(patch) > remaining:
         patch = patch[:remaining] + "\n\n[diff truncated due to size]"
     return header + patch
+
+
+def _paginated_get(url: str, headers: dict[str, str], timeout: int = 60) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        resp = requests.get(
+            url, headers=headers, params={"per_page": 100, "page": page}, timeout=timeout
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        items.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return items
+
+
+def get_authenticated_login(token: str) -> str:
+    """Return the GitHub login of the account behind `token`."""
+    headers = _headers(token)
+    resp = requests.get("https://api.github.com/user", headers=headers, timeout=30)
+    if resp.status_code == 401:
+        raise PermissionError("GitHub authentication failed. Use GitHub login in Settings.")
+    resp.raise_for_status()
+    return (resp.json() or {}).get("login") or ""
+
+
+def fetch_review_comments(ref: PullRequestRef, token: str = "") -> list[dict[str, Any]]:
+    """Inline (line-anchored) PR review comments."""
+    headers = _headers(token)
+    base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+    return _paginated_get(f"{base}/pulls/{ref.number}/comments", headers)
+
+
+def fetch_issue_comments(ref: PullRequestRef, token: str = "") -> list[dict[str, Any]]:
+    """Top-level PR conversation / summary comments."""
+    headers = _headers(token)
+    base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+    return _paginated_get(f"{base}/issues/{ref.number}/comments", headers)
+
+
+def get_file_content(
+    ref: PullRequestRef, path: str, branch: str, token: str = ""
+) -> tuple[str, str]:
+    """Return (text_content, sha) for `path` on `branch`."""
+    headers = _headers(token)
+    base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+    resp = requests.get(
+        f"{base}/contents/{path}", headers=headers, params={"ref": branch}, timeout=30
+    )
+    if resp.status_code == 404:
+        raise FileNotFoundError(f"{path} not found on branch {branch}.")
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("encoding") != "base64" or "content" not in data:
+        raise ValueError(f"Cannot read contents of {path} (unsupported encoding or too large).")
+    content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+    return content, data["sha"]
+
+
+def update_file_content(
+    ref: PullRequestRef,
+    path: str,
+    branch: str,
+    new_content: str,
+    sha: str,
+    message: str,
+    token: str = "",
+) -> dict[str, Any]:
+    """Commit `new_content` to `path` on `branch` via the Contents API."""
+    headers = _headers(token)
+    base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+    encoded = base64.b64encode(new_content.encode("utf-8")).decode("ascii")
+    resp = requests.put(
+        f"{base}/contents/{path}",
+        headers=headers,
+        json={"message": message, "content": encoded, "sha": sha, "branch": branch},
+        timeout=60,
+    )
+    if resp.status_code == 409:
+        raise RuntimeError(
+            f"{path} changed on GitHub since it was read (stale sha). Re-run the check and retry."
+        )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def post_issue_comment(ref: PullRequestRef, body: str, token: str = "") -> dict[str, Any]:
+    headers = _headers(token)
+    base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+    resp = requests.post(
+        f"{base}/issues/{ref.number}/comments", headers=headers, json={"body": body}, timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def reply_to_review_comment(
+    ref: PullRequestRef, comment_id: int, body: str, token: str = ""
+) -> dict[str, Any]:
+    headers = _headers(token)
+    base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+    resp = requests.post(
+        f"{base}/pulls/{ref.number}/comments/{comment_id}/replies",
+        headers=headers,
+        json={"body": body},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()

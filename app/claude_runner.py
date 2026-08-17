@@ -15,6 +15,13 @@ from app.process_util import no_window_kwargs
 
 ClaudeEventCallback = Callable[[dict[str, str]], None]
 
+# Pre-approve a narrow set of read-only lookups (repo/PR context) so headless
+# runs can verify a claim against the real repo instead of stalling on a
+# permission prompt nobody is present to answer. Anything outside this list
+# (writes, arbitrary shell commands) still requires approval it will never
+# get, so Claude just reports it couldn't check further rather than acting.
+ALLOWED_TOOLS = "Bash(gh api *),Bash(gh pr *),Bash(git log *),Read"
+
 
 class ClaudeError(RuntimeError):
     pass
@@ -194,6 +201,7 @@ def run_claude_wsl(
         f'set -euo pipefail; '
         f'PROMPT=$(cat "{wsl_prompt}"); '
         f'"{claude}" -p "$PROMPT" '
+        f'--allowedTools "{ALLOWED_TOOLS}" '
         f"--output-format stream-json --verbose --include-partial-messages"
     )
     final_text = ""
@@ -266,6 +274,8 @@ def run_claude_cli(
             resolved,
             "-p",
             prompt_path.read_text(encoding="utf-8"),
+            "--allowedTools",
+            ALLOWED_TOOLS,
             "--output-format",
             "stream-json",
             "--verbose",
@@ -303,7 +313,15 @@ def run_claude_cli(
             # Fall back to non-stream text mode.
             pass
         completed = subprocess.run(
-            [resolved, "-p", prompt_path.read_text(encoding="utf-8"), "--output-format", "text"],
+            [
+                resolved,
+                "-p",
+                prompt_path.read_text(encoding="utf-8"),
+                "--allowedTools",
+                ALLOWED_TOOLS,
+                "--output-format",
+                "text",
+            ],
             capture_output=True,
             text=True,
             encoding="utf-8",

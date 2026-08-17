@@ -138,19 +138,22 @@ def get_github_token_from_windows_gcm() -> str:
 def resolve_github_token(explicit_token: str = "", use_wsl: bool = True) -> tuple[str, str]:
     """
     Returns (token, source_label).
-    Prefers an explicit app setting, then WSL git-credentials, then Windows GCM.
+    Prefers an explicit app setting, then Windows GCM (this app's own GitHub
+    login stores credentials there), then WSL git-credentials as a fallback
+    for setups that authenticate git through WSL instead.
     """
     if explicit_token.strip():
         return explicit_token.strip(), "settings"
+    try:
+        return get_github_token_from_windows_gcm(), "windows-gcm"
+    except WslAuthError:
+        pass
     if use_wsl:
         try:
             return get_github_token_from_wsl(), "wsl-git-credentials"
         except WslAuthError:
             pass
-    try:
-        return get_github_token_from_windows_gcm(), "windows-gcm"
-    except WslAuthError as exc:
-        raise WslAuthError(
-            "No GitHub token found in app settings, WSL, or Windows Git Credential Manager. "
-            "Use Settings → Login with GitHub (browser)."
-        ) from exc
+    raise WslAuthError(
+        "No GitHub token found in app settings, Windows Git Credential Manager, or WSL. "
+        "Use Settings → Login with GitHub (browser)."
+    )

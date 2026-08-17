@@ -21,7 +21,10 @@ class Prompt:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Prompt":
         repo_type = (data.get("repo_type") or GENERIC_REPO_TYPE).strip().lower()
-        is_generic = bool(data.get("is_generic")) or repo_type == GENERIC_REPO_TYPE
+        if data.get("is_generic") is None:
+            is_generic = repo_type == GENERIC_REPO_TYPE
+        else:
+            is_generic = bool(data["is_generic"])
         if is_generic:
             repo_type = GENERIC_REPO_TYPE
         return cls(

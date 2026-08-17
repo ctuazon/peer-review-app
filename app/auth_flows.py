@@ -236,12 +236,17 @@ def start_claude_sso_login(*, email: str = "") -> str:
     )
 
 
-def check_github_auth() -> tuple[bool, str]:
-    """Return (ok, detail). Verifies a usable token against the GitHub API."""
+def check_github_auth(explicit_token: str = "", use_wsl: bool = True) -> tuple[bool, str]:
+    """Return (ok, detail). Verifies a usable token against the GitHub API.
+
+    Takes the same explicit_token/use_wsl inputs as the review flow's own
+    resolve_github_token() call, so this status check reflects whichever
+    auth source a real run would actually use.
+    """
     from app.wsl_auth import resolve_github_token
 
     try:
-        token, source = resolve_github_token("", use_wsl=True)
+        token, source = resolve_github_token(explicit_token, use_wsl=use_wsl)
     except Exception as exc:  # noqa: BLE001
         return False, f"not signed in ({exc})"
 

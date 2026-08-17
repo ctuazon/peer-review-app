@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
@@ -15,8 +16,14 @@ if str(ROOT) not in sys.path:
 
 from app import load_config, save_config
 from app.auth_status_store import clear_auth_status, load_auth_status, save_auth_status
+from app.bot_review import (
+    BotFinding,
+    apply_bot_fix,
+    post_bot_reply,
+    run_bot_comment_check,
+)
 from app.diff_view import DiffReviewView, enable_selection_copy
-from app.github_pr import parse_pr_url
+from app.github_pr import PullRequestDiff, parse_pr_url
 from app.history_store import (
     HistoryEntry,
     add_history_entry,
@@ -236,6 +243,8 @@ class PromptEditorDialog(tk.Toplevel):
     def _on_generic_toggle(self) -> None:
         if self.generic_var.get():
             self.repo_var.set(GENERIC_REPO_TYPE)
+        elif self.repo_var.get().strip().lower() == GENERIC_REPO_TYPE:
+            self.repo_var.set("")
 
     def _save(self) -> None:
         name = self.name_var.get().strip()
@@ -272,6 +281,233 @@ class PromptEditorDialog(tk.Toplevel):
             messagebox.showerror("Save failed", str(exc), parent=self)
             return
         self.destroy()
+
+
+class BotReviewDialog(tk.Toplevel):
+    """Shows CodeRabbit / Amazon Q findings with per-item apply/reply actions."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        diff: PullRequestDiff,
+        findings: list[BotFinding],
+        token: str,
+    ) -> None:
+        super().__init__(master)
+        self.diff = diff
+        self.token = token
+        self.title(f"Bot comments — {diff.ref.full_name}#{diff.ref.number}")
+        self.resizable(True, True)
+        self.transient(master)
+        self.geometry("880x640")
+
+        header = ttk.Frame(self, padding=(12, 12, 12, 4))
+        header.pack(fill=tk.X)
+        valid_count = sum(1 for f in findings if f.verdict.valid)
+        ttk.Label(
+            header,
+            text=(
+                f"{diff.title}\n"
+                f"{len(findings)} bot comment(s) found — {valid_count} judged valid, "
+                f"{len(findings) - valid_count} judged not valid."
+            ),
+            justify=tk.LEFT,
+        ).pack(anchor="w")
+
+        canvas = tk.Canvas(self, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0), pady=(4, 12))
+
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind(
+            "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        canvas.bind(
+            "<Enter>",
+            lambda _e: canvas.bind_all(
+                "<MouseWheel>",
+                lambda ev: canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units"),
+            ),
+        )
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        for finding in findings:
+            self._build_card(inner, finding)
+
+        ttk.Button(self, text="Close", command=self.destroy).pack(pady=(0, 10))
+
+    def _make_scroll_text(
+        self, parent: tk.Misc, *, height: int, wrap: str = tk.WORD, font=None
+    ) -> tuple[ttk.Frame, tk.Text]:
+        """A Text widget with an attached vertical scrollbar, for content that
+        may run longer than the visible height."""
+        frame = ttk.Frame(parent)
+        kwargs: dict = {"height": height, "wrap": wrap}
+        if font:
+            kwargs["font"] = font
+        text = tk.Text(frame, **kwargs)
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        return frame, text
+
+    def _build_card(self, parent: tk.Misc, finding: BotFinding) -> None:
+        comment = finding.comment
+        verdict = finding.verdict
+        location = f"{comment.path}:{comment.line}" if comment.path else "PR summary comment"
+
+        card = ttk.LabelFrame(parent, text=f"[{comment.source}] {location}", padding=10)
+        card.pack(fill=tk.X, expand=True, padx=4, pady=6)
+
+        verdict_color = "#1a7f37" if verdict.valid else "#cf222e"
+        verdict_text = "VALID" if verdict.valid else "NOT VALID"
+        tk.Label(
+            card, text=verdict_text, fg=verdict_color, font=("Segoe UI", 9, "bold")
+        ).pack(anchor="w")
+
+        ttk.Label(card, text=verdict.reason or "(no reason given)", wraplength=760, justify=tk.LEFT).pack(
+            anchor="w", pady=(2, 6)
+        )
+
+        original = ttk.LabelFrame(card, text="Original bot comment", padding=6)
+        original.pack(fill=tk.X, pady=(0, 6))
+        body = comment.body.strip() or "(empty)"
+        original_frame, original_text = self._make_scroll_text(
+            original, height=min(10, max(2, body.count("\n") + 2))
+        )
+        original_text.insert("1.0", body)
+        original_text.configure(state=tk.DISABLED)
+        original_frame.pack(fill=tk.BOTH, expand=True)
+
+        has_fix = verdict.valid and bool(verdict.fix_file) and verdict.fix_content is not None
+        if has_fix:
+            fix_box = ttk.LabelFrame(card, text=f"Proposed fix — {verdict.fix_file}", padding=6)
+            fix_box.pack(fill=tk.X, pady=(0, 6))
+            lines = verdict.fix_content.splitlines()
+            shown_lines = lines[:30]
+            shown = "\n".join(shown_lines)
+            if len(lines) > 30:
+                shown += f"\n… ({len(lines) - 30} more lines)"
+            fix_text = tk.Text(
+                fix_box,
+                height=min(16, max(4, len(shown_lines) + 1)),
+                wrap=tk.NONE,
+                font=("Consolas", 9),
+            )
+            fix_text.insert("1.0", shown)
+            fix_text.configure(state=tk.DISABLED)
+            fix_text.pack(fill=tk.X)
+
+        reply_box = ttk.LabelFrame(card, text="Reply to post (edit before sending)", padding=6)
+        reply_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        reply_body = verdict.reply_text or ""
+        reply_frame, reply_widget = self._make_scroll_text(
+            reply_box, height=min(8, max(3, reply_body.count("\n") + 2))
+        )
+        reply_widget.insert("1.0", reply_body)
+        reply_frame.pack(fill=tk.BOTH, expand=True)
+
+        status_var = tk.StringVar(value="")
+        action_row = ttk.Frame(card)
+        action_row.pack(fill=tk.X, pady=(4, 0))
+
+        if has_fix:
+            apply_btn = ttk.Button(action_row, text="Apply fix + reply")
+            apply_btn.configure(
+                command=lambda f=finding, b=apply_btn, s=status_var, w=reply_widget: self._apply_fix(
+                    f, b, s, w
+                )
+            )
+            apply_btn.pack(side=tk.LEFT)
+        else:
+            reply_btn = ttk.Button(action_row, text="Post reply")
+            reply_btn.configure(
+                command=lambda f=finding, b=reply_btn, s=status_var, w=reply_widget: self._post_reply(
+                    f, b, s, w
+                )
+            )
+            reply_btn.pack(side=tk.LEFT)
+
+        ttk.Label(action_row, textvariable=status_var).pack(side=tk.LEFT, padx=(10, 0))
+
+        if comment.html_url:
+            link = ttk.Label(card, text="Open on GitHub", foreground="#0969da", cursor="hand2")
+            link.pack(anchor="w", pady=(4, 0))
+            link.bind("<Button-1>", lambda _e, u=comment.html_url: webbrowser.open(u))
+
+    def _apply_fix(
+        self,
+        finding: BotFinding,
+        button: ttk.Button,
+        status_var: tk.StringVar,
+        reply_widget: tk.Text,
+    ) -> None:
+        reply_text = reply_widget.get("1.0", "end-1c").strip()
+        if not reply_text:
+            messagebox.showerror("Missing reply", "The reply text can't be empty.", parent=self)
+            return
+        finding.verdict.reply_text = reply_text
+        button.configure(state=tk.DISABLED)
+        status_var.set("Applying…")
+
+        def worker() -> None:
+            try:
+                apply_bot_fix(self.diff, finding, self.token)
+                post_bot_reply(self.diff, finding, self.token)
+                self.after(
+                    0,
+                    lambda: self._card_action_succeeded(reply_widget, status_var, "Applied + replied ✓"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.after(0, lambda e=err: self._card_action_failed(button, status_var, e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _post_reply(
+        self,
+        finding: BotFinding,
+        button: ttk.Button,
+        status_var: tk.StringVar,
+        reply_widget: tk.Text,
+    ) -> None:
+        reply_text = reply_widget.get("1.0", "end-1c").strip()
+        if not reply_text:
+            messagebox.showerror("Missing reply", "The reply text can't be empty.", parent=self)
+            return
+        finding.verdict.reply_text = reply_text
+        button.configure(state=tk.DISABLED)
+        status_var.set("Posting…")
+
+        def worker() -> None:
+            try:
+                post_bot_reply(self.diff, finding, self.token)
+                self.after(
+                    0,
+                    lambda: self._card_action_succeeded(reply_widget, status_var, "Reply posted ✓"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.after(0, lambda e=err: self._card_action_failed(button, status_var, e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _card_action_succeeded(
+        self, reply_widget: tk.Text, status_var: tk.StringVar, message: str
+    ) -> None:
+        status_var.set(message)
+        reply_widget.configure(state=tk.DISABLED)
+
+    def _card_action_failed(self, button: ttk.Button, status_var: tk.StringVar, error: str) -> None:
+        button.configure(state=tk.NORMAL)
+        status_var.set("Failed")
+        messagebox.showerror("Action failed", error, parent=self)
 
 
 class SettingsDialog(tk.Toplevel):
@@ -438,10 +674,13 @@ class SettingsDialog(tk.Toplevel):
         self.github_status_var.set("GitHub: checking…")
         self.claude_status_var.set("Claude: checking…")
 
+        token = self.token_var.get().strip()
+        use_wsl = bool(self.wsl_auth_var.get())
+
         def worker() -> None:
             from app.auth_flows import check_claude_auth, check_github_auth
 
-            gh_ok, gh_detail = check_github_auth()
+            gh_ok, gh_detail = check_github_auth(token, use_wsl=use_wsl)
             cl_ok, cl_detail = check_claude_auth()
             self.after(
                 0,
@@ -663,6 +902,10 @@ class PeerReviewApp(tk.Tk):
             action_row, text="Ask Claude", command=self.start_ask
         )
         self.ask_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.bot_check_btn = ttk.Button(
+            action_row, text="Check bot comments", command=self.start_bot_check
+        )
+        self.bot_check_btn.pack(side=tk.LEFT, padx=(6, 0))
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(action_row, textvariable=self.status_var).pack(side=tk.LEFT, padx=12)
         self.thinking = ThinkingIndicator(action_row)
@@ -1190,10 +1433,14 @@ class PeerReviewApp(tk.Tk):
         self.claude_auth_label_var.set("Claude")
         self.status_var.set("Checking auth…")
 
+        config = load_config()
+        token = config.get("github_token") or ""
+        use_wsl = bool(config.get("use_wsl_github_auth", True))
+
         def worker() -> None:
             from app.auth_flows import check_claude_auth, check_github_auth
 
-            gh_ok, gh_detail = check_github_auth()
+            gh_ok, gh_detail = check_github_auth(token, use_wsl=use_wsl)
             cl_ok, cl_detail = check_claude_auth()
             self.after(
                 0,
@@ -1535,11 +1782,82 @@ class PeerReviewApp(tk.Tk):
     def start_ask(self) -> None:
         self._start_claude_job(mode="ask")
 
+    def start_bot_check(self) -> None:
+        if self._busy:
+            return
+        url = self.pr_url_var.get().strip()
+        if not url:
+            messagebox.showerror("Missing PR", "Paste a GitHub PR URL.")
+            return
+        try:
+            parse_pr_url(url)
+        except ValueError as exc:
+            messagebox.showerror("Invalid URL", str(exc))
+            return
+
+        config = load_config()
+        self._busy = True
+        self._set_run_buttons_enabled(False)
+        self.status_var.set("Checking for CodeRabbit / Amazon Q comments")
+        self.thinking.start("Checking bot comments")
+        self.diff_view.clear()
+        self._clear_live_claude()
+        self._show_panel("live")
+
+        def on_claude_event(event: dict) -> None:
+            kind = str(event.get("kind") or "")
+            text = str(event.get("text") or "")
+            self.after(0, lambda k=kind, t=text: self._append_live_claude(k, t))
+
+        def worker() -> None:
+            try:
+                diff, findings, token = run_bot_comment_check(
+                    pr_url=url, config=config, on_event=on_claude_event
+                )
+                self.after(
+                    0,
+                    lambda d=diff, f=findings, t=token: self._bot_check_success(d, f, t),
+                )
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.after(0, lambda e=err: self._bot_check_failure(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _bot_check_success(
+        self, diff: PullRequestDiff, findings: list[BotFinding], token: str
+    ) -> None:
+        self.thinking.stop()
+        self._busy = False
+        self._set_run_buttons_enabled(True)
+        pr_ref = f"{diff.ref.full_name}#{diff.ref.number}"
+        if not findings:
+            self.status_var.set(f"Done — no CodeRabbit/Amazon Q comments found on {pr_ref}.")
+            messagebox.showinfo(
+                "No bot comments",
+                f"No CodeRabbit or Amazon Q comments were found on {pr_ref}.",
+            )
+            return
+        valid_count = sum(1 for f in findings if f.verdict.valid)
+        self.status_var.set(
+            f"Done — {len(findings)} bot comment(s) on {pr_ref}, "
+            f"{valid_count} valid. Review below."
+        )
+        BotReviewDialog(self, diff=diff, findings=findings, token=token)
+
+    def _bot_check_failure(self, error: str) -> None:
+        self.thinking.stop()
+        self._busy = False
+        self._set_run_buttons_enabled(True)
+        self.status_var.set("Failed")
+        messagebox.showerror("Bot comment check failed", error)
+
     def _set_run_buttons_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
         self.run_btn.configure(state=state)
         self.explain_btn.configure(state=state)
         self.ask_btn.configure(state=state)
+        self.bot_check_btn.configure(state=state)
 
     def _start_claude_job(self, *, mode: str) -> None:
         if self._busy:
