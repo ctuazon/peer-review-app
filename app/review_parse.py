@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
+
+from app.github_pr import PullRequestDiff, create_review_comment, post_issue_comment
 
 
 @dataclass
@@ -62,6 +65,34 @@ def comments_to_copy_text(comments: list[ReviewComment]) -> str:
     if not comments:
         return ""
     return "\n\n".join(c.copy_block for c in comments) + "\n"
+
+
+def format_review_comment_body(comment: ReviewComment) -> str:
+    sev = (comment.severity or "nit").upper()
+    return f"**[{sev}]** {comment.comment.strip()}"
+
+
+def post_review_comment(
+    diff: PullRequestDiff, comment: ReviewComment, token: str = ""
+) -> dict[str, Any]:
+    """Post one parsed review comment to GitHub.
+
+    Line-anchored comments become an inline PR review comment; comments with
+    no line (orphans that didn't match a line in the diff) fall back to a
+    general issue comment so they aren't silently dropped.
+    """
+    body = format_review_comment_body(comment)
+    if comment.line is None:
+        return post_issue_comment(diff.ref, f"**{comment.file_path}**\n\n{body}", token=token)
+    return create_review_comment(
+        diff.ref,
+        commit_id=diff.head_sha,
+        path=comment.file_path,
+        line=comment.line,
+        side=comment.side,
+        body=body,
+        token=token,
+    )
 
 
 def build_verification_prompt(

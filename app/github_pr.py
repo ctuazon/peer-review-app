@@ -48,6 +48,7 @@ class PullRequestDiff:
     author: str
     base_branch: str
     head_branch: str
+    head_sha: str = ""
     files: list[dict[str, Any]] = field(default_factory=list)
     patch_text: str = ""
     changed_lines: list[ChangedLine] = field(default_factory=list)
@@ -203,6 +204,7 @@ def fetch_pull_request(url: str, token: str = "") -> PullRequestDiff:
         author=(pr.get("user") or {}).get("login") or "",
         base_branch=(pr.get("base") or {}).get("ref") or "",
         head_branch=(pr.get("head") or {}).get("ref") or "",
+        head_sha=(pr.get("head") or {}).get("sha") or "",
         files=files,
         patch_text="\n".join(patch_chunks),
         changed_lines=changed_lines,
@@ -376,6 +378,28 @@ def post_issue_comment(ref: PullRequestRef, body: str, token: str = "") -> dict[
     base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
     resp = requests.post(
         f"{base}/issues/{ref.number}/comments", headers=headers, json={"body": body}, timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def create_review_comment(
+    ref: PullRequestRef,
+    commit_id: str,
+    path: str,
+    line: int,
+    side: str,
+    body: str,
+    token: str = "",
+) -> dict[str, Any]:
+    """Post a new inline (line-anchored) review comment on the PR's diff."""
+    headers = _headers(token)
+    base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+    resp = requests.post(
+        f"{base}/pulls/{ref.number}/comments",
+        headers=headers,
+        json={"commit_id": commit_id, "path": path, "line": line, "side": side, "body": body},
+        timeout=30,
     )
     resp.raise_for_status()
     return resp.json()

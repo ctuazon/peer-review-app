@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
-from typing import Iterable
+from typing import Callable, Iterable
 
 from app.diff_model import DiffDisplayRow, normalize_path, parse_patch_display_rows
 from app.github_pr import PullRequestDiff
@@ -203,6 +203,10 @@ class CollapsiblePanel(ttk.Frame):
         self._title_var.set(self._header_text())
 
     @property
+    def title(self) -> str:
+        return self._title
+
+    @property
     def expanded(self) -> bool:
         return self._expanded
 
@@ -239,8 +243,30 @@ class DiffReviewView(ttk.Frame):
         self._diff: PullRequestDiff | None = None
         self._panels: list[CollapsiblePanel] = []
         self._text_widgets: list[tk.Text] = []
+        self._pages: list[CollapsiblePanel] = []
+        self._page_index = 0
+        self._comment_anchors: list[tuple[int, tk.Text, str]] = []
+        self._comment_cursor = -1
+        # Set by the host app; called with no args when "Submit to GitHub" is
+        # clicked. The host reads back the diff/comments via get_diff() /
+        # get_comments() rather than receiving them as callback args, so it
+        # always sees whatever is currently rendered.
+        self.on_submit_review: Callable[[], None] | None = None
 
-        toolbar = ttk.Frame(self)
+        # Submit gets its own row so it's never squeezed off-screen by a long
+        # summary line sharing the toolbar row below (pack(side=RIGHT) in the
+        # same row as an unbounded-width label can get clipped past the
+        # window edge instead of wrapping or shrinking the label). The row
+        # itself is only packed while there's something to submit -- see
+        # _set_submit_visible() -- rather than left showing a disabled button.
+        self._action_bar = ttk.Frame(self)
+        self.submit_btn = ttk.Button(
+            self._action_bar, text="Submit to GitHub…", command=self._handle_submit_click
+        )
+        self.submit_btn.pack(side=tk.RIGHT)
+        self._submit_visible = False
+
+        self._toolbar = toolbar = ttk.Frame(self)
         toolbar.pack(fill=tk.X, pady=(0, 4))
         ttk.Button(toolbar, text="Expand all", command=self.expand_all).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="Collapse all", command=self.collapse_all).pack(
@@ -249,12 +275,48 @@ class DiffReviewView(ttk.Frame):
         self.summary_var = tk.StringVar(value="")
         ttk.Label(toolbar, textvariable=self.summary_var).pack(side=tk.LEFT, padx=10)
 
-        # Scrollable container for panels.
-        self.canvas = tk.Canvas(self, highlightthickness=0, background="#ffffff")
-        self.vscroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
+        # Paginate by file — shown only when a rendered PR has more than one
+        # file, so a single-file review keeps the old always-expanded layout.
+        # Prev/Next live on their own row, separate from the file label below
+        # them -- otherwise Next's position shifts with the label's length
+        # (a long file path pushes it further right, a short one less so).
+        self.pager = ttk.Frame(self)
+        pager_buttons = ttk.Frame(self.pager)
+        pager_buttons.pack(fill=tk.X)
+        self.prev_btn = ttk.Button(pager_buttons, text="◀ Prev", command=self.prev_page)
+        self.prev_btn.pack(side=tk.LEFT)
+        self.next_btn = ttk.Button(pager_buttons, text="Next ▶", command=self.next_page)
+        self.next_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.page_label_var = tk.StringVar(value="")
+        ttk.Label(self.pager, textvariable=self.page_label_var).pack(
+            anchor="w", pady=(2, 0)
+        )
+
+        # Jump-to-comment bar — sits under the review window itself, and (like
+        # the pager) is shown only when there's something to navigate to.
+        self.jump_bar = ttk.Frame(self)
+        self.jump_btn = ttk.Button(
+            self.jump_bar, text="Next comment ▼", command=self.jump_to_next_comment
+        )
+        self.jump_btn.pack(side=tk.LEFT)
+        self.jump_label_var = tk.StringVar(value="")
+        self.jump_label = ttk.Label(self.jump_bar, textvariable=self.jump_label_var)
+        self.jump_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        # Scrollable container for panels. Grouped in its own frame so the
+        # pager/jump bars above and below can be shown or hidden later without
+        # disturbing the pack order (they're always inserted with
+        # before=self.canvas_frame, which is packed last so it claims all
+        # remaining space).
+        self.canvas_frame = ttk.Frame(self)
+        self.canvas = tk.Canvas(self.canvas_frame, highlightthickness=0, background="#ffffff")
+        self.vscroll = ttk.Scrollbar(
+            self.canvas_frame, orient=tk.VERTICAL, command=self.canvas.yview
+        )
         self.canvas.configure(yscrollcommand=self.vscroll.set)
         self.vscroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.canvas_frame.pack(fill=tk.BOTH, expand=True)
 
         self.inner = ttk.Frame(self.canvas)
         self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
@@ -296,16 +358,143 @@ class DiffReviewView(ttk.Frame):
         self._diff = None
         self._panels.clear()
         self._text_widgets.clear()
+        self._pages.clear()
+        self._page_index = 0
+        self._comment_anchors.clear()
+        self._comment_cursor = -1
         self.summary_var.set("")
+        self._set_submit_visible(False)
+        self.pager.pack_forget()
+        self.jump_bar.pack_forget()
+        self._update_jump_ui()
         for child in self.inner.winfo_children():
             child.destroy()
         self.canvas.configure(scrollregion=(0, 0, 0, 0))
+
+    def _update_jump_ui(self) -> None:
+        total = len(self._comment_anchors)
+        if total == 0:
+            self.jump_bar.pack_forget()
+            return
+        if not self.jump_bar.winfo_ismapped():
+            self.jump_bar.pack(
+                side=tk.BOTTOM, fill=tk.X, pady=(4, 0), before=self.canvas_frame
+            )
+        if self._comment_cursor < 0:
+            self.jump_label_var.set(f"{total} comment{'s' if total != 1 else ''}")
+        else:
+            self.jump_label_var.set(f"({self._comment_cursor + 1}/{total})")
+
+    def _update_pager(self) -> None:
+        total = len(self._pages)
+        if total <= 1:
+            self.pager.pack_forget()
+            return
+        self.pager.pack(fill=tk.X, pady=(0, 4), before=self.canvas_frame)
+        panel = self._pages[self._page_index]
+        self.page_label_var.set(
+            f"File {self._page_index + 1} of {total}  ·  {panel.title}"
+        )
+        self.prev_btn.configure(state=tk.NORMAL if self._page_index > 0 else tk.DISABLED)
+        self.next_btn.configure(
+            state=tk.NORMAL if self._page_index < total - 1 else tk.DISABLED
+        )
+
+    def _show_page(self, index: int) -> None:
+        if not self._pages:
+            return
+        index = max(0, min(index, len(self._pages) - 1))
+        for i, panel in enumerate(self._pages):
+            if i == index:
+                panel.pack(fill=tk.X, padx=2, pady=3)
+            else:
+                panel.pack_forget()
+        self._page_index = index
+        self._update_pager()
+        self.canvas.yview_moveto(0)
+        self.after(50, self._on_inner_configure)
+
+    def prev_page(self) -> None:
+        self._show_page(self._page_index - 1)
+
+    def next_page(self) -> None:
+        self._show_page(self._page_index + 1)
+
+    def jump_to_next_comment(self) -> None:
+        if not self._comment_anchors:
+            return
+        self._comment_cursor = (self._comment_cursor + 1) % len(self._comment_anchors)
+        page_index, text, mark = self._comment_anchors[self._comment_cursor]
+        self._update_jump_ui()
+        if page_index != self._page_index:
+            self._show_page(page_index)
+        self._pages[page_index].expand()
+        self.after(80, lambda: self._focus_comment(text, mark))
+
+    def _focus_comment(self, text: tk.Text, mark: str) -> None:
+        try:
+            text.see(mark)
+        except tk.TclError:
+            return
+        self.update_idletasks()
+        self._scroll_canvas_to_mark(text, mark)
+        self._flash_mark(text, mark)
+
+    def _scroll_canvas_to_mark(self, text: tk.Text, mark: str) -> None:
+        try:
+            bbox = text.bbox(mark)
+        except tk.TclError:
+            bbox = None
+        canvas_top = text.winfo_rooty() - self.canvas.winfo_rooty()
+        y_offset = bbox[1] if bbox else 0
+        target = self.canvas.canvasy(canvas_top + y_offset)
+        region = self.canvas.bbox("all")
+        if not region:
+            return
+        total_height = region[3] - region[1]
+        if total_height <= 0:
+            return
+        frac = max(0.0, min(1.0, (target - 60) / total_height))
+        self.canvas.yview_moveto(frac)
+
+    def _flash_mark(self, text: tk.Text, mark: str) -> None:
+        try:
+            start = text.index(mark)
+            end = f"{mark} lineend"
+            text.tag_remove("jump_flash", "1.0", tk.END)
+            text.tag_add("jump_flash", start, end)
+            text.tag_raise("jump_flash")
+        except tk.TclError:
+            return
+        self.after(1200, lambda: self._clear_flash(text))
+
+    def _clear_flash(self, text: tk.Text) -> None:
+        try:
+            text.tag_remove("jump_flash", "1.0", tk.END)
+        except tk.TclError:
+            pass
+
+    def _handle_submit_click(self) -> None:
+        if self.on_submit_review:
+            self.on_submit_review()
+
+    def _set_submit_visible(self, visible: bool) -> None:
+        if visible == self._submit_visible:
+            return
+        self._submit_visible = visible
+        if visible:
+            self._action_bar.pack(fill=tk.X, pady=(0, 4), before=self._toolbar)
+        else:
+            self._action_bar.pack_forget()
 
     def get_copy_text(self) -> str:
         return self._copy_text
 
     def get_comments(self) -> list[ReviewComment]:
         return list(self._comments)
+
+    def get_diff(self) -> PullRequestDiff | None:
+        return self._diff
 
     def has_review_content(self) -> bool:
         return bool(self._comments) or bool(self._copy_text.strip())
@@ -406,8 +595,8 @@ class DiffReviewView(ttk.Frame):
                 has_review=comment_count > 0,
                 severity=worst,
             )
-            panel.pack(fill=tk.X, padx=2, pady=3)
             self._panels.append(panel)
+            self._pages.append(panel)
 
             text = self._make_diff_text(panel.body)
             self._text_widgets.append(text)
@@ -420,7 +609,7 @@ class DiffReviewView(ttk.Frame):
                     matched = self._comments_for_row(row, by_key)
                     for comment in matched:
                         used.add(id(comment))
-                        self._insert_comment(text, comment)
+                        self._insert_comment(text, comment, len(self._pages) - 1)
 
             enable_selection_copy(text)
             self._fit_text_height(text)
@@ -436,16 +625,18 @@ class DiffReviewView(ttk.Frame):
                 has_review=True,
                 severity=_worst_severity(leftover),
             )
-            panel.pack(fill=tk.X, padx=2, pady=3)
             self._panels.append(panel)
+            self._pages.append(panel)
             text = self._make_diff_text(panel.body)
             self._text_widgets.append(text)
             for comment in leftover:
-                self._insert_comment(text, comment)
+                self._insert_comment(text, comment, len(self._pages) - 1)
             enable_selection_copy(text)
             self._fit_text_height(text)
 
-        self.after(50, self._on_inner_configure)
+        self._update_jump_ui()
+        self._show_page(0)
+        self._set_submit_visible(bool(self._comments))
 
     def _make_diff_text(self, parent: tk.Misc) -> tk.Text:
         text = tk.Text(
@@ -546,6 +737,7 @@ class DiffReviewView(ttk.Frame):
         )
         for sev, color in SEVERITY_COLORS.items():
             t.tag_configure(f"sev_{sev}", foreground=color, font=("Consolas", 9, "bold"))
+        t.tag_configure("jump_flash", background="#ffd33d")
         # Tag backgrounds (comment_box, added, …) were configured after sel and would
         # hide the selection highlight unless sel is raised again.
         apply_visible_selection(t)
@@ -587,7 +779,12 @@ class DiffReviewView(ttk.Frame):
         text.insert(tk.END, f"{prefix} ", (prefix_tag, body_tag))
         text.insert(tk.END, f"{row.text}\n", (body_tag,))
 
-    def _insert_comment(self, text: tk.Text, comment: ReviewComment) -> None:
+    def _insert_comment(self, text: tk.Text, comment: ReviewComment, page_index: int) -> None:
+        mark = f"cmt_anchor_{len(self._comment_anchors)}"
+        text.mark_set(mark, text.index(tk.END))
+        text.mark_gravity(mark, tk.LEFT)
+        self._comment_anchors.append((page_index, text, mark))
+
         sev = (comment.severity or "nit").lower()
         sev_tag = f"sev_{sev}" if sev in SEVERITY_COLORS else "comment_header"
         header = (

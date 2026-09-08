@@ -44,6 +44,8 @@ from app.prompts_store import (
     update_prompt,
 )
 from app.review import format_copy_friendly, run_peer_review, run_pr_ask, run_pr_explanation
+from app.review_parse import ReviewComment, post_review_comment
+from app.wsl_auth import resolve_github_token
 
 
 class StatusLight:
@@ -180,6 +182,30 @@ class ThinkingIndicator(ttk.Frame):
         self._after_id = self.after(90, self._tick)
 
 
+def _known_repo_types() -> list[str]:
+    """Repo-type suggestions: exact repo names seen in past PRs, plus repo
+    types already used by other prompts. Picking one of these guarantees a
+    match in prompts_for_repo() (exact repo-name match), instead of guessing
+    a token that may not appear in the actual GitHub repo slug."""
+    seen: dict[str, str] = {}
+
+    for entry in list_history():
+        if not entry.pr_url:
+            continue
+        try:
+            ref = parse_pr_url(entry.pr_url)
+        except ValueError:
+            continue
+        seen.setdefault(ref.repo.lower(), ref.repo)
+
+    for prompt in list_prompts():
+        if prompt.is_generic or prompt.repo_type.lower() == GENERIC_REPO_TYPE:
+            continue
+        seen.setdefault(prompt.repo_type.lower(), prompt.repo_type)
+
+    return sorted(seen.values(), key=str.lower)
+
+
 class PromptEditorDialog(tk.Toplevel):
     def __init__(self, master: tk.Misc, prompt: Prompt | None = None) -> None:
         super().__init__(master)
@@ -205,12 +231,16 @@ class PromptEditorDialog(tk.Toplevel):
         )
         repo_row = ttk.Frame(frame)
         repo_row.grid(row=1, column=1, sticky="ew", pady=4)
-        ttk.Entry(repo_row, textvariable=self.repo_var, width=30).pack(
-            side=tk.LEFT, fill=tk.X, expand=True
-        )
-        ttk.Label(repo_row, text="(e.g. marketplace-ssr, api, generic)").pack(
-            side=tk.LEFT, padx=8
-        )
+        ttk.Combobox(
+            repo_row,
+            textvariable=self.repo_var,
+            width=28,
+            values=_known_repo_types(),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(
+            repo_row,
+            text="(pick the exact repo name from a past PR, e.g. marketplace-ssr)",
+        ).pack(side=tk.LEFT, padx=8)
 
         self.generic_var = tk.BooleanVar(
             value=prompt.is_generic if prompt else True
@@ -614,6 +644,138 @@ class BotReviewDialog(tk.Toplevel):
         button.configure(state=tk.NORMAL)
         status_var.set("Failed")
         messagebox.showerror("Action failed", error, parent=self)
+
+
+class SubmitReviewDialog(tk.Toplevel):
+    """Review, edit, and post the AI-drafted comments to GitHub as real PR
+    review comments — one card per parsed comment, each with its own Submit
+    button so a file with several comments can be posted selectively rather
+    than all-or-nothing."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        diff: PullRequestDiff,
+        comments: list[ReviewComment],
+        token: str,
+    ) -> None:
+        super().__init__(master)
+        self.title("Submit review comments to GitHub")
+        self.geometry("820x640")
+        self.transient(master)
+        self.grab_set()
+
+        self.diff = diff
+        self.token = token
+        self._comments = comments
+        self._text_widgets: dict[int, tk.Text] = {}
+        self._status_vars: dict[int, tk.StringVar] = {}
+        self._submit_buttons: dict[int, ttk.Button] = {}
+
+        header = ttk.Frame(self, padding=(12, 10, 12, 4))
+        header.pack(fill=tk.X)
+        ttk.Label(
+            header,
+            text=(
+                f"{diff.ref.full_name}#{diff.ref.number} — "
+                f"{len(comments)} comment(s) parsed from the review"
+            ),
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            header,
+            text="Edit any comment's text, then submit it on its own — nothing posts until you click Submit on that card.",
+            foreground="#57606a",
+        ).pack(anchor="w")
+
+        canvas = tk.Canvas(self, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
+
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        canvas.bind(
+            "<Enter>",
+            lambda _e: canvas.bind_all(
+                "<MouseWheel>",
+                lambda ev: canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units"),
+            ),
+        )
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        for comment in comments:
+            self._build_card(inner, comment)
+
+        bottom = ttk.Frame(self, padding=(12, 6, 12, 10))
+        bottom.pack(fill=tk.X)
+        ttk.Button(bottom, text="Close", command=self.destroy).pack(side=tk.RIGHT)
+
+    def _build_card(self, parent: tk.Misc, comment: ReviewComment) -> None:
+        location = (
+            f"{comment.file_path}:{comment.line} ({comment.side})"
+            if comment.line is not None
+            else f"{comment.file_path} (no line match — posted as a general PR comment)"
+        )
+        sev = (comment.severity or "nit").upper()
+        card = ttk.LabelFrame(parent, text=f"[{sev}] {location}", padding=8)
+        card.pack(fill=tk.X, expand=True, padx=4, pady=6)
+
+        text_frame = ttk.Frame(card)
+        text_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        body = comment.comment.strip()
+        text = tk.Text(
+            text_frame, height=min(8, max(2, body.count("\n") + 2)), wrap=tk.WORD
+        )
+        text.insert("1.0", body)
+        scroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._text_widgets[id(comment)] = text
+
+        action_row = ttk.Frame(card)
+        action_row.pack(fill=tk.X)
+        submit_btn = ttk.Button(action_row, text="Submit")
+        submit_btn.configure(command=lambda c=comment, b=submit_btn: self._submit_one(c, b))
+        submit_btn.pack(side=tk.LEFT)
+        self._submit_buttons[id(comment)] = submit_btn
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(action_row, textvariable=status_var, foreground="#57606a").pack(
+            side=tk.LEFT, padx=(10, 0)
+        )
+        self._status_vars[id(comment)] = status_var
+
+    def _submit_one(self, comment: ReviewComment, button: ttk.Button) -> None:
+        edited = self._text_widgets[id(comment)].get("1.0", "end-1c").strip()
+        comment.comment = edited or comment.comment
+        status_var = self._status_vars[id(comment)]
+        button.configure(state=tk.DISABLED)
+        status_var.set("posting…")
+
+        def worker() -> None:
+            try:
+                post_review_comment(self.diff, comment, self.token)
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.after(0, lambda: self._submit_failed(button, status_var, err))
+            else:
+                self.after(0, lambda: self._submit_succeeded(status_var))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _submit_succeeded(self, status_var: tk.StringVar) -> None:
+        status_var.set("posted ✓")
+
+    def _submit_failed(self, button: ttk.Button, status_var: tk.StringVar, error: str) -> None:
+        button.configure(state=tk.NORMAL)
+        status_var.set("failed")
+        messagebox.showerror("Failed to post comment", error, parent=self)
 
 
 class SettingsDialog(tk.Toplevel):
@@ -1120,6 +1282,7 @@ class PeerReviewApp(tk.Tk):
 
         self.diff_view = DiffReviewView(output_box)
         self.diff_view.pack(fill=tk.BOTH, expand=True)
+        self.diff_view.on_submit_review = self.open_submit_review
         # Keep a hidden plain buffer for fallback copy of raw review text.
         self._last_review_raw = ""
         self._last_explanation = ""
@@ -2318,6 +2481,29 @@ class PeerReviewApp(tk.Tk):
         self.copy_all_btn.configure(state=state)
         self.copy_selected_btn.configure(state=state)
         self.copy_llm_btn.configure(state=state)
+
+    def open_submit_review(self) -> None:
+        diff = self.diff_view.get_diff()
+        comments = self.diff_view.get_comments()
+        if diff is None or not comments:
+            messagebox.showinfo("Submit to GitHub", "Run a peer review with comments first.")
+            return
+        config = load_config()
+        try:
+            token, _auth_source = resolve_github_token(
+                explicit_token=config.get("github_token") or "",
+                use_wsl=bool(config.get("use_wsl_github_auth", True)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("GitHub authentication", str(exc))
+            return
+        if not diff.head_sha:
+            messagebox.showerror(
+                "Submit to GitHub",
+                "Missing the PR's head commit SHA — re-run the peer review and try again.",
+            )
+            return
+        SubmitReviewDialog(self, diff=diff, comments=list(comments), token=token)
 
     def copy_as_llm_prompt(self) -> None:
         if self._output_mode == "explain":
