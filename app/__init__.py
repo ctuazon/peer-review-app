@@ -19,6 +19,10 @@ DEFAULT_CONFIG = {
     "anthropic_api_key": "",
     "claude_cli_path": "claude",
     "claude_model": "claude-sonnet-4-20250514",
+    # Cheaper/faster model for the bot-comment triage and self-review verdict
+    # stages (classification-style yes/no judgments), leaving claude_model
+    # for the actual fix-drafting stage. Blank disables the override.
+    "bot_cheap_model": "claude-haiku-4-5-20251001",
     "claude_sso_email": "czyrus.tuazon@traderinteractive.com",
 }
 

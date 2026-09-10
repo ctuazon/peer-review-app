@@ -251,6 +251,40 @@ def _paginated_get(url: str, headers: dict[str, str], timeout: int = 60) -> list
     return items
 
 
+def get_pr_mergeable_state(ref: PullRequestRef, token: str = "") -> dict[str, Any]:
+    """Raw mergeability fields for a PR. `mergeable` is None while GitHub is
+    still computing it -- callers should poll rather than treat that as a
+    definitive answer."""
+    headers = _headers(token)
+    base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+    resp = requests.get(f"{base}/pulls/{ref.number}", headers=headers, timeout=30)
+    resp.raise_for_status()
+    pr = resp.json()
+    return {
+        "mergeable": pr.get("mergeable"),
+        "mergeable_state": pr.get("mergeable_state") or "",
+        "base_branch": (pr.get("base") or {}).get("ref") or "",
+        "head_branch": (pr.get("head") or {}).get("ref") or "",
+        "base_sha": (pr.get("base") or {}).get("sha") or "",
+        "head_sha": (pr.get("head") or {}).get("sha") or "",
+    }
+
+
+def get_merge_base_sha(ref: PullRequestRef, base: str, head: str, token: str = "") -> str:
+    """The common-ancestor commit sha for `base...head`, via GitHub's compare
+    API -- used to do a real three-way merge locally without needing the
+    repo's full history."""
+    headers = _headers(token)
+    api_base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+    resp = requests.get(f"{api_base}/compare/{base}...{head}", headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    sha = ((data.get("merge_base_commit") or {}).get("sha")) or ""
+    if not sha:
+        raise ValueError(f"GitHub did not return a merge-base commit for {base}...{head}.")
+    return sha
+
+
 def get_authenticated_login(token: str) -> str:
     """Return the GitHub login of the account behind `token`."""
     headers = _headers(token)
@@ -273,6 +307,15 @@ def fetch_issue_comments(ref: PullRequestRef, token: str = "") -> list[dict[str,
     headers = _headers(token)
     base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
     return _paginated_get(f"{base}/issues/{ref.number}/comments", headers)
+
+
+def fetch_pr_reviews(ref: PullRequestRef, token: str = "") -> list[dict[str, Any]]:
+    """Top-level PR review summaries (the body attached to an Approve / Request
+    changes / Comment review action) -- distinct from the line-anchored
+    comments returned by fetch_review_comments."""
+    headers = _headers(token)
+    base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+    return _paginated_get(f"{base}/pulls/{ref.number}/reviews", headers)
 
 
 def get_file_content(

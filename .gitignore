@@ -1,6 +1,7 @@
 data/config.json
 data/auth_status.json
 data/history.json
+data/triage_cache.json
 __pycache__/
 *.pyc
 .venv/

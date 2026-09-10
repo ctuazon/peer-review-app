@@ -50,9 +50,9 @@ def build_review_prompt(
     prompt_name = reviewer_prompt.name if reviewer_prompt else "Ad-hoc"
     story_text = story.strip() or "(No story/context provided.)"
 
-    return f"""{SYSTEM_OUTPUT_CONTRACT}
-
-Reviewer prompt name: {prompt_name}
+    # SYSTEM_OUTPUT_CONTRACT is passed separately (see run_peer_review) so it
+    # can be cached instead of being rebilled as input tokens on every call.
+    return f"""Reviewer prompt name: {prompt_name}
 Reviewer prompt:
 {prompt_body or "(No specialized reviewer prompt selected. Use sound general engineering judgment.)"}
 
@@ -91,7 +91,7 @@ def run_peer_review(
         story=story,
         diff=diff,
     )
-    review = run_claude(prompt, config, on_event=on_claude_event)
+    review = run_claude(prompt, config, on_event=on_claude_event, system=SYSTEM_OUTPUT_CONTRACT)
     # Stash auth source on the diff object for UI status (non-serialized helper).
     setattr(diff, "auth_source", auth_source)
     return diff, review.strip()

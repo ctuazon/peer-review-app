@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -21,6 +22,12 @@ ClaudeEventCallback = Callable[[dict[str, str]], None]
 # (writes, arbitrary shell commands) still requires approval it will never
 # get, so Claude just reports it couldn't check further rather than acting.
 ALLOWED_TOOLS = "Bash(gh api *),Bash(gh pr *),Bash(git log *),Read"
+
+# Model ids/aliases only ever come from our own config/constants, but the WSL
+# path interpolates this into a shell string (unlike the CLI path, which
+# passes it as a separate argv element) -- so it's still validated before
+# being embedded, rather than trusted blindly.
+_SAFE_MODEL_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 
 
 class ClaudeError(RuntimeError):
@@ -48,6 +55,24 @@ def _emit(on_event: ClaudeEventCallback | None, kind: str, text: str) -> None:
     if on_event is None or not text:
         return
     on_event({"kind": kind, "text": text})
+
+
+def _emit_usage(
+    on_event: ClaudeEventCallback | None,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+) -> None:
+    if on_event is None:
+        return
+    on_event(
+        {
+            "kind": "usage",
+            "input_tokens": str(input_tokens),
+            "output_tokens": str(output_tokens),
+            "cache_read_tokens": str(cache_read_tokens),
+        }
+    )
 
 
 def _parse_stream_line(
@@ -140,6 +165,14 @@ def _parse_stream_line(
         return None
 
     if event_type == "result":
+        usage = obj.get("usage")
+        if isinstance(usage, dict):
+            _emit_usage(
+                on_event,
+                int(usage.get("input_tokens") or 0),
+                int(usage.get("output_tokens") or 0),
+                int(usage.get("cache_read_input_tokens") or 0),
+            )
         result = obj.get("result")
         if isinstance(result, str) and result.strip():
             return result
@@ -177,6 +210,7 @@ def _finalize_claude_output(
 def run_claude_wsl(
     prompt: str,
     on_event: ClaudeEventCallback | None = None,
+    model: str | None = None,
 ) -> str:
     claude = find_wsl_claude()
     if not claude:
@@ -184,6 +218,8 @@ def run_claude_wsl(
             "Claude Code not found in WSL. Use Settings → Login with Claude SSO, "
             "or install Claude Code."
         )
+    if model and not _SAFE_MODEL_RE.match(model):
+        raise ClaudeError(f"Invalid model id: {model!r}")
 
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -196,13 +232,18 @@ def run_claude_wsl(
         prompt_path = Path(handle.name)
 
     wsl_prompt = win_path_to_wsl(prompt_path)
-    # Stream NDJSON so the UI can show thinking / live text.
+    model_flag = f'--model "{model}" ' if model else ""
+    # Stream NDJSON so the UI can show thinking / live text. The prompt is
+    # piped in via stdin redirection rather than passed as a CLI argument --
+    # a large diff/triage prompt embedded in argv can exceed the OS's
+    # argument-length limit ("Argument list too long").
     bash = (
         f'set -euo pipefail; '
-        f'PROMPT=$(cat "{wsl_prompt}"); '
-        f'"{claude}" -p "$PROMPT" '
+        f'"{claude}" -p '
         f'--allowedTools "{ALLOWED_TOOLS}" '
-        f"--output-format stream-json --verbose --include-partial-messages"
+        f"{model_flag}"
+        f"--output-format stream-json --verbose --include-partial-messages "
+        f'< "{wsl_prompt}"'
     )
     final_text = ""
     text_acc: list[str] = []
@@ -253,10 +294,11 @@ def run_claude_cli(
     prompt: str,
     cli_path: str = "claude",
     on_event: ClaudeEventCallback | None = None,
+    model: str | None = None,
 ) -> str:
     resolved = resolve_claude_cli(cli_path)
     if not resolved:
-        return run_claude_wsl(prompt, on_event=on_event)
+        return run_claude_wsl(prompt, on_event=on_event, model=model)
 
     # Local CLI: try streaming first, then fall back to plain text.
     with tempfile.NamedTemporaryFile(
@@ -269,28 +311,34 @@ def run_claude_cli(
         handle.write(prompt)
         prompt_path = Path(handle.name)
 
+    model_args = ["--model", model] if model else []
     try:
+        # Prompt is piped in via stdin, not passed as a CLI argument -- a
+        # large diff/triage prompt embedded in argv can exceed the OS's
+        # command-line length limit (Windows caps this around 32K chars).
         cmd = [
             resolved,
             "-p",
-            prompt_path.read_text(encoding="utf-8"),
             "--allowedTools",
             ALLOWED_TOOLS,
+            *model_args,
             "--output-format",
             "stream-json",
             "--verbose",
             "--include-partial-messages",
         ]
         _emit(on_event, "status", "starting Claude")
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **no_window_kwargs(),
-        )
+        with open(prompt_path, "r", encoding="utf-8") as stdin_handle:
+            process = subprocess.Popen(
+                cmd,
+                stdin=stdin_handle,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **no_window_kwargs(),
+            )
         assert process.stdout is not None
         final_text = ""
         text_acc: list[str] = []
@@ -312,24 +360,26 @@ def run_claude_cli(
         except ClaudeError:
             # Fall back to non-stream text mode.
             pass
-        completed = subprocess.run(
-            [
-                resolved,
-                "-p",
-                prompt_path.read_text(encoding="utf-8"),
-                "--allowedTools",
-                ALLOWED_TOOLS,
-                "--output-format",
-                "text",
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=600,
-            check=False,
-            **no_window_kwargs(),
-        )
+        with open(prompt_path, "r", encoding="utf-8") as stdin_handle:
+            completed = subprocess.run(
+                [
+                    resolved,
+                    "-p",
+                    "--allowedTools",
+                    ALLOWED_TOOLS,
+                    *model_args,
+                    "--output-format",
+                    "text",
+                ],
+                stdin=stdin_handle,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=600,
+                check=False,
+                **no_window_kwargs(),
+            )
         if completed.returncode == 0 and (completed.stdout or "").strip():
             text = completed.stdout.strip()
             _emit(on_event, "text", text)
@@ -351,6 +401,7 @@ def run_claude_api(
     api_key: str,
     model: str = "claude-sonnet-4-20250514",
     on_event: ClaudeEventCallback | None = None,
+    system: str | None = None,
 ) -> str:
     if not api_key:
         raise ClaudeError("Anthropic API key is missing. Set it in Settings.")
@@ -365,13 +416,21 @@ def run_claude_api(
     client = Anthropic(api_key=api_key)
     _emit(on_event, "status", "requesting")
     parts: list[str] = []
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 8192,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system:
+        # Cache the (constant, often large) instruction text as its own
+        # block: Anthropic will reuse it across calls that repeat this exact
+        # prefix instead of rebilling it as fresh input tokens every time.
+        request_kwargs["system"] = [
+            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+        ]
     # Prefer streaming API when available.
     try:
-        with client.messages.stream(
-            model=model,
-            max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}],
-        ) as stream:
+        with client.messages.stream(**request_kwargs) as stream:
             for event in stream:
                 et = getattr(event, "type", "")
                 if et == "content_block_delta":
@@ -393,16 +452,21 @@ def run_claude_api(
                     if text:
                         parts.append(text)
     except Exception:
-        message = client.messages.create(
-            model=model,
-            max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        message = client.messages.create(**request_kwargs)
         for block in message.content:
             text = getattr(block, "text", None)
             if text:
                 parts.append(text)
                 _emit(on_event, "text", text)
+
+    usage = getattr(message, "usage", None)
+    if usage is not None:
+        _emit_usage(
+            on_event,
+            int(getattr(usage, "input_tokens", 0) or 0),
+            int(getattr(usage, "output_tokens", 0) or 0),
+            int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+        )
 
     result = "".join(parts).strip()
     if not result:
@@ -415,28 +479,43 @@ def run_claude(
     prompt: str,
     config: dict[str, Any],
     on_event: ClaudeEventCallback | None = None,
+    model: str | None = None,
+    system: str | None = None,
 ) -> str:
+    """model, when given, overrides config["claude_model"] for this one call
+    -- e.g. a cheap classification stage that doesn't need the full model.
+
+    system, when given, is constant instruction text shared across many
+    calls (e.g. an output-format contract). In API mode it's sent as its own
+    cache_control'd block so repeated calls don't rebill it as fresh input
+    tokens. The WSL/local-CLI paths have no equivalent cache control to hook
+    into, so there it's just folded into the prompt text as before.
+    """
     mode = (config.get("claude_mode") or "cli").lower()
     if mode == "api":
         return run_claude_api(
             prompt,
             api_key=config.get("anthropic_api_key") or "",
-            model=config.get("claude_model") or "claude-sonnet-4-20250514",
+            model=model or config.get("claude_model") or "claude-sonnet-4-20250514",
             on_event=on_event,
+            system=system,
         )
+    combined_prompt = f"{system}\n\n{prompt}" if system else prompt
     if mode in {"wsl", "sso"} or bool(config.get("use_wsl_claude", True)):
         try:
-            return run_claude_wsl(prompt, on_event=on_event)
+            return run_claude_wsl(combined_prompt, on_event=on_event, model=model)
         except ClaudeError:
             if resolve_claude_cli(config.get("claude_cli_path") or "claude"):
                 return run_claude_cli(
-                    prompt,
+                    combined_prompt,
                     cli_path=config.get("claude_cli_path") or "claude",
                     on_event=on_event,
+                    model=model,
                 )
             raise
     return run_claude_cli(
-        prompt,
+        combined_prompt,
         cli_path=config.get("claude_cli_path") or "claude",
         on_event=on_event,
+        model=model,
     )

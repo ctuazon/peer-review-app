@@ -23,7 +23,7 @@ from app.bot_review import (
     run_bot_comment_check,
 )
 from app.diff_view import DiffReviewView, enable_selection_copy
-from app.github_pr import PullRequestDiff, parse_pr_url
+from app.github_pr import PullRequestDiff, fetch_pull_request, parse_pr_url
 from app.history_store import (
     HistoryEntry,
     add_history_entry,
@@ -31,6 +31,14 @@ from app.history_store import (
     delete_history_entry,
     get_history_entry,
     list_history,
+)
+from app.lint_fix import LintFinding, apply_lint_fixes_batch, run_lint_check
+from app.merge_conflict import (
+    ConflictFile,
+    ConflictSession,
+    MergeabilityInfo,
+    draft_resolution,
+    open_conflict_session,
 )
 from app.prompts_store import (
     GENERIC_REPO_TYPE,
@@ -314,8 +322,9 @@ class PromptEditorDialog(tk.Toplevel):
 
 
 class BotReviewDialog(tk.Toplevel):
-    """Shows CodeRabbit / Amazon Q findings. Fixable findings get a checkbox
-    to queue them; queued fixes are pushed as a single commit via Apply all."""
+    """Shows CodeRabbit / Amazon Q findings plus human reviewer feedback.
+    Fixable findings get a checkbox to queue them; queued fixes are pushed as
+    a single commit via Apply all."""
 
     def __init__(
         self,
@@ -324,15 +333,17 @@ class BotReviewDialog(tk.Toplevel):
         diff: PullRequestDiff,
         findings: list[BotFinding],
         token: str,
+        config: dict,
     ) -> None:
         super().__init__(master)
         self.diff = diff
         self.token = token
+        self.config = config
         self._findings = list(findings)
         self._queue_vars: dict[int, tk.BooleanVar] = {}
         self._reply_widgets: dict[int, tk.Text] = {}
         self._card_state: dict[int, dict] = {}
-        self.title(f"Bot comments — {diff.ref.full_name}#{diff.ref.number}")
+        self.title(f"Review comments — {diff.ref.full_name}#{diff.ref.number}")
         self.resizable(True, True)
         self.transient(master)
         self.geometry("880x680")
@@ -340,13 +351,15 @@ class BotReviewDialog(tk.Toplevel):
         header = ttk.Frame(self, padding=(12, 12, 12, 4))
         header.pack(fill=tk.X)
         valid_count = sum(1 for f in findings if f.verdict.valid)
+        addressed_count = sum(1 for f in findings if not f.verdict.valid and f.verdict.addressed)
+        not_applicable_count = len(findings) - valid_count - addressed_count
         fixable_count = sum(1 for f in findings if f.verdict.valid and f.verdict.fixes)
         ttk.Label(
             header,
             text=(
                 f"{diff.title}\n"
-                f"{len(findings)} bot comment(s) found — {valid_count} judged valid, "
-                f"{len(findings) - valid_count} judged not valid, "
+                f"{len(findings)} comment(s) found (bots + reviewers) — {valid_count} judged valid, "
+                f"{addressed_count} already addressed, {not_applicable_count} not applicable, "
                 f"{fixable_count} with a proposed fix.\n"
                 "Check the fixes you want, then Apply all pushes them as one commit."
             ),
@@ -408,13 +421,22 @@ class BotReviewDialog(tk.Toplevel):
     def _build_card(self, parent: tk.Misc, finding: BotFinding) -> None:
         comment = finding.comment
         verdict = finding.verdict
-        location = f"{comment.path}:{comment.line}" if comment.path else "PR summary comment"
+        if comment.path:
+            location = f"{comment.path}:{comment.line}"
+        elif comment.kind == "review":
+            location = f"PR review ({comment.review_state})" if comment.review_state else "PR review"
+        else:
+            location = "PR summary comment"
 
         card = ttk.LabelFrame(parent, text=f"[{comment.source}] {location}", padding=10)
         card.pack(fill=tk.X, expand=True, padx=4, pady=6)
 
-        verdict_color = "#1a7f37" if verdict.valid else "#cf222e"
-        verdict_text = "VALID" if verdict.valid else "NOT VALID"
+        if verdict.valid:
+            verdict_color, verdict_text = "#1a7f37", "VALID"
+        elif verdict.addressed:
+            verdict_color, verdict_text = "#57606a", "ALREADY ADDRESSED"
+        else:
+            verdict_color, verdict_text = "#cf222e", "NOT VALID"
         tk.Label(
             card, text=verdict_text, fg=verdict_color, font=("Segoe UI", 9, "bold")
         ).pack(anchor="w")
@@ -432,7 +454,7 @@ class BotReviewDialog(tk.Toplevel):
                 justify=tk.LEFT,
             ).pack(anchor="w", pady=(0, 6))
 
-        original = ttk.LabelFrame(card, text="Original bot comment", padding=6)
+        original = ttk.LabelFrame(card, text="Original comment", padding=6)
         original.pack(fill=tk.X, pady=(0, 6))
         body = comment.body.strip() or "(empty)"
         original_frame, original_text = self._make_scroll_text(
@@ -551,9 +573,16 @@ class BotReviewDialog(tk.Toplevel):
             state["check"].configure(state=tk.DISABLED)
             state["status_var"].set("Queued…")
 
+        def on_merge_event(event: dict) -> None:
+            text = str(event.get("text") or "")
+            if text:
+                self.after(0, lambda t=text: self.apply_all_status_var.set(t))
+
         def worker() -> None:
             try:
-                apply_bot_fixes_batch(self.diff, selected, self.token)
+                apply_bot_fixes_batch(
+                    self.diff, selected, self.token, self.config, on_event=on_merge_event
+                )
                 self.after(0, lambda: self._batch_commit_succeeded(selected))
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
@@ -644,6 +673,469 @@ class BotReviewDialog(tk.Toplevel):
         button.configure(state=tk.NORMAL)
         status_var.set("Failed")
         messagebox.showerror("Action failed", error, parent=self)
+
+
+class MergeConflictDialog(tk.Toplevel):
+    """Review Claude's proposed resolution for each conflicting file (content
+    conflicts) and choose keep-vs-delete for structural ones, then push a
+    real two-parent merge commit once approved. Every non-conflicting file
+    in the merge was already resolved by git's own merge engine before this
+    dialog opens -- only what git itself flagged as conflicting is shown."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        diff: PullRequestDiff,
+        info: MergeabilityInfo,
+        session: ConflictSession,
+        conflicts: list[ConflictFile],
+        token: str,
+        config: dict,
+    ) -> None:
+        super().__init__(master)
+        self.diff = diff
+        self.info = info
+        self.session = session
+        self.token = token
+        self.config = config
+        self._conflicts = list(conflicts)
+        self._resolution_widgets: dict[int, tk.Text] = {}
+        self._delete_choice_vars: dict[int, tk.StringVar] = {}
+        self.title(f"Merge conflicts — {diff.ref.full_name}#{diff.ref.number}")
+        self.resizable(True, True)
+        self.transient(master)
+        self.geometry("900x700")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        header = ttk.Frame(self, padding=(12, 12, 12, 4))
+        header.pack(fill=tk.X)
+        ttk.Label(
+            header,
+            text=(
+                f"{diff.title}\n"
+                f"Merging {info.base_branch} into {info.head_branch} — "
+                f"{len(conflicts)} conflicting file(s).\n"
+                "Review each resolution below (edit freely), then Push merge commit."
+            ),
+            justify=tk.LEFT,
+        ).pack(anchor="w")
+
+        canvas = tk.Canvas(self, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0), pady=(4, 12))
+
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        canvas.bind(
+            "<Enter>",
+            lambda _e: canvas.bind_all(
+                "<MouseWheel>",
+                lambda ev: canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units"),
+            ),
+        )
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        for conflict in self._conflicts:
+            self._build_card(inner, conflict)
+
+        bottom_bar = ttk.Frame(self, padding=(12, 0, 12, 4))
+        bottom_bar.pack(fill=tk.X)
+        self.push_status_var = tk.StringVar(value="")
+        ttk.Label(bottom_bar, textvariable=self.push_status_var).pack(side=tk.LEFT)
+        self.push_btn = ttk.Button(
+            bottom_bar, text="Push merge commit", command=self._push
+        )
+        self.push_btn.pack(side=tk.RIGHT)
+
+        ttk.Button(self, text="Close", command=self._on_close).pack(pady=(0, 10))
+
+    def _make_scroll_text(
+        self, parent: tk.Misc, *, height: int, wrap: str = tk.WORD, font=None
+    ) -> tuple[ttk.Frame, tk.Text]:
+        frame = ttk.Frame(parent)
+        kwargs: dict = {"height": height, "wrap": wrap}
+        if font:
+            kwargs["font"] = font
+        text = tk.Text(frame, **kwargs)
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        return frame, text
+
+    def _build_card(self, parent: tk.Misc, conflict: ConflictFile) -> None:
+        card = ttk.LabelFrame(parent, text=conflict.path, padding=10)
+        card.pack(fill=tk.X, expand=True, padx=4, pady=6)
+
+        if conflict.kind == "delete_conflict":
+            deleted_where = self.info.head_branch if conflict.deleted_side == "ours" else self.info.base_branch
+            modified_where = self.info.base_branch if conflict.deleted_side == "ours" else self.info.head_branch
+            kept_content = conflict.theirs_content if conflict.deleted_side == "ours" else conflict.ours_content
+            ttk.Label(
+                card,
+                text=f"Deleted on {deleted_where}, modified on {modified_where}.",
+                foreground="#9a6700",
+                wraplength=820,
+                justify=tk.LEFT,
+            ).pack(anchor="w", pady=(0, 6))
+
+            choice_var = tk.StringVar(value="keep")
+            self._delete_choice_vars[id(conflict)] = choice_var
+
+            content_box = ttk.LabelFrame(card, text=f"Content on {modified_where}", padding=6)
+            content_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+            body = kept_content or "(empty)"
+            content_frame, content_text = self._make_scroll_text(
+                content_box, height=min(16, max(3, body.count("\n") + 2)), font=("Consolas", 9)
+            )
+            content_text.insert("1.0", body)
+            content_frame.pack(fill=tk.BOTH, expand=True)
+            self._resolution_widgets[id(conflict)] = content_text
+
+            def on_choice_change(text=content_text) -> None:
+                text.configure(state=tk.NORMAL if choice_var.get() == "keep" else tk.DISABLED)
+
+            ttk.Radiobutton(
+                card,
+                text="Keep the modified version (nothing intentional gets lost)",
+                variable=choice_var,
+                value="keep",
+                command=on_choice_change,
+            ).pack(anchor="w")
+            ttk.Radiobutton(
+                card,
+                text="Honor the deletion (remove this file)",
+                variable=choice_var,
+                value="delete",
+                command=on_choice_change,
+            ).pack(anchor="w")
+            return
+
+        # kind == "content"
+        if not conflict.resolved:
+            ttk.Label(
+                card,
+                text=f"Could not auto-resolve: {conflict.unresolved_reason or 'unknown reason'}",
+                foreground="#cf222e",
+                wraplength=820,
+                justify=tk.LEFT,
+            ).pack(anchor="w", pady=(0, 6))
+        elif not conflict.safe:
+            ttk.Label(
+                card,
+                text=f"Self-review flagged this resolution: {conflict.safety_notes}",
+                foreground="#cf222e",
+                wraplength=820,
+                justify=tk.LEFT,
+            ).pack(anchor="w", pady=(0, 6))
+
+        markers_box = ttk.LabelFrame(card, text="Original conflict markers", padding=6)
+        markers_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        markers_frame, markers_text = self._make_scroll_text(
+            markers_box,
+            height=min(12, max(3, conflict.marker_text.count("\n") + 2)),
+            wrap=tk.NONE,
+            font=("Consolas", 9),
+        )
+        markers_text.insert("1.0", conflict.marker_text)
+        markers_text.configure(state=tk.DISABLED)
+        markers_frame.pack(fill=tk.BOTH, expand=True)
+
+        resolution_box = ttk.LabelFrame(card, text="Proposed resolution (edit before pushing)", padding=6)
+        resolution_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        body = conflict.resolved_content or ""
+        resolution_frame, resolution_text = self._make_scroll_text(
+            resolution_box, height=min(20, max(4, body.count("\n") + 2)), wrap=tk.NONE, font=("Consolas", 9)
+        )
+        resolution_text.insert("1.0", body)
+        resolution_frame.pack(fill=tk.BOTH, expand=True)
+        self._resolution_widgets[id(conflict)] = resolution_text
+
+    def _collect_resolutions(self) -> bool:
+        """Copies edited widget text back onto each conflict. Returns False
+        (and shows an error) if a content conflict was left empty."""
+        for conflict in self._conflicts:
+            widget = self._resolution_widgets.get(id(conflict))
+            if conflict.kind == "delete_conflict":
+                choice = self._delete_choice_vars[id(conflict)].get()
+                if choice == "delete":
+                    conflict.resolved_content = None
+                else:
+                    conflict.resolved_content = widget.get("1.0", "end-1c") if widget else ""
+                continue
+            text = widget.get("1.0", "end-1c") if widget else ""
+            if not text.strip():
+                messagebox.showerror(
+                    "Empty resolution",
+                    f"The resolution for {conflict.path} can't be empty.",
+                    parent=self,
+                )
+                return False
+            conflict.resolved_content = text
+        return True
+
+    def _push(self) -> None:
+        if not self._collect_resolutions():
+            return
+        if not messagebox.askyesno(
+            "Push merge commit",
+            f"Push a merge commit of {self.info.base_branch} into {self.info.head_branch} "
+            f"on {self.diff.ref.full_name}#{self.diff.ref.number}?\n\n"
+            "This pushes directly to the PR branch and can't be undone from here.",
+            parent=self,
+        ):
+            return
+
+        self.push_btn.configure(state=tk.DISABLED)
+        self.push_status_var.set("Pushing…")
+
+        def on_merge_event(event: dict) -> None:
+            text = str(event.get("text") or "")
+            if text:
+                self.after(0, lambda t=text: self.push_status_var.set(t))
+
+        def worker() -> None:
+            try:
+                message = (
+                    f"Merge {self.info.base_branch} into {self.info.head_branch}\n\n"
+                    "Conflict resolution drafted by Peer Review App / Claude, reviewed before push."
+                )
+                commit_sha = self.session.apply_and_push(message, on_event=on_merge_event)
+                self.after(0, lambda sha=commit_sha: self._push_succeeded(sha))
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.after(0, lambda e=err: self._push_failed(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _push_succeeded(self, commit_sha: str) -> None:
+        self.push_status_var.set(f"Pushed {commit_sha[:12]} ✓")
+        messagebox.showinfo(
+            "Merge commit pushed",
+            f"Pushed merge commit {commit_sha[:12]} to {self.info.head_branch}.",
+            parent=self,
+        )
+        self.destroy()
+
+    def _push_failed(self, error: str) -> None:
+        self.push_btn.configure(state=tk.NORMAL)
+        self.push_status_var.set("")
+        messagebox.showerror("Push failed", error, parent=self)
+
+    def _on_close(self) -> None:
+        self.session.close()
+        self.destroy()
+
+
+class LintFixDialog(tk.Toplevel):
+    """Shows lint/style issues Claude found on the lines this PR actually
+    changed, plus its proposed fix per file. Queued fixes get pushed as a
+    single commit via Apply all -- same batching UX as the bot-comment fix
+    flow, minus the reply-to-a-comment step (there's no GitHub thread to
+    reply to for a self-found lint issue)."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        diff: PullRequestDiff,
+        findings: list[LintFinding],
+        token: str,
+    ) -> None:
+        super().__init__(master)
+        self.diff = diff
+        self.token = token
+        self._findings = list(findings)
+        self._queue_vars: dict[int, tk.BooleanVar] = {}
+        self._card_state: dict[int, dict] = {}
+        self.title(f"Lint issues — {diff.ref.full_name}#{diff.ref.number}")
+        self.resizable(True, True)
+        self.transient(master)
+        self.geometry("880x680")
+
+        header = ttk.Frame(self, padding=(12, 12, 12, 4))
+        header.pack(fill=tk.X)
+        fixable_count = sum(1 for f in findings if f.fix is not None and f.safe)
+        ttk.Label(
+            header,
+            text=(
+                f"{diff.title}\n"
+                f"{len(findings)} file(s) with lint issues on the lines this PR changed — "
+                f"{fixable_count} with a fix ready.\n"
+                "Check the fixes you want, then Apply all pushes them as one commit."
+            ),
+            justify=tk.LEFT,
+        ).pack(anchor="w")
+
+        canvas = tk.Canvas(self, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0), pady=(4, 12))
+
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        canvas.bind(
+            "<Enter>",
+            lambda _e: canvas.bind_all(
+                "<MouseWheel>",
+                lambda ev: canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units"),
+            ),
+        )
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        for finding in findings:
+            self._build_card(inner, finding)
+
+        if fixable_count:
+            bottom_bar = ttk.Frame(self, padding=(12, 0, 12, 4))
+            bottom_bar.pack(fill=tk.X)
+            self.apply_all_status_var = tk.StringVar(value="")
+            ttk.Label(bottom_bar, textvariable=self.apply_all_status_var).pack(side=tk.LEFT)
+            self.apply_all_btn = ttk.Button(
+                bottom_bar, text="Apply all", state=tk.DISABLED, command=self._apply_all
+            )
+            self.apply_all_btn.pack(side=tk.RIGHT)
+
+        ttk.Button(self, text="Close", command=self.destroy).pack(pady=(0, 10))
+
+    def _make_scroll_text(
+        self, parent: tk.Misc, *, height: int, wrap: str = tk.WORD, font=None
+    ) -> tuple[ttk.Frame, tk.Text]:
+        frame = ttk.Frame(parent)
+        kwargs: dict = {"height": height, "wrap": wrap}
+        if font:
+            kwargs["font"] = font
+        text = tk.Text(frame, **kwargs)
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        return frame, text
+
+    def _build_card(self, parent: tk.Misc, finding: LintFinding) -> None:
+        card = ttk.LabelFrame(parent, text=finding.path, padding=10)
+        card.pack(fill=tk.X, expand=True, padx=4, pady=6)
+
+        issues_text = "\n".join(f"- {issue}" for issue in finding.issues) or "(no detail given)"
+        ttk.Label(card, text=issues_text, wraplength=760, justify=tk.LEFT).pack(
+            anchor="w", pady=(0, 6)
+        )
+
+        if finding.fix is None:
+            ttk.Label(
+                card,
+                text=finding.safety_notes or "No fix drafted.",
+                foreground="#9a6700",
+                wraplength=760,
+                justify=tk.LEFT,
+            ).pack(anchor="w", pady=(0, 6))
+            return
+
+        if not finding.safe:
+            ttk.Label(
+                card,
+                text=f"Self-review flagged this fix: {finding.safety_notes}",
+                foreground="#cf222e",
+                wraplength=760,
+                justify=tk.LEFT,
+            ).pack(anchor="w", pady=(0, 6))
+
+        fix_box = ttk.LabelFrame(card, text="Proposed fix", padding=6)
+        fix_box.pack(fill=tk.X, pady=(0, 6))
+        diff_text = finding.fix.diff_text or "(no textual difference detected)"
+        lines = diff_text.splitlines()
+        shown_lines = lines[:60]
+        shown = "\n".join(shown_lines)
+        if len(lines) > 60:
+            shown += f"\n… ({len(lines) - 60} more lines)"
+        fix_text = tk.Text(
+            fix_box, height=min(20, max(4, len(shown_lines) + 1)), wrap=tk.NONE, font=("Consolas", 9)
+        )
+        fix_text.insert("1.0", shown)
+        fix_text.configure(state=tk.DISABLED)
+        fix_text.pack(fill=tk.X)
+
+        if not finding.safe:
+            return  # unsafe fixes are shown for transparency but can't be queued
+
+        status_var = tk.StringVar(value="")
+        action_row = ttk.Frame(card)
+        action_row.pack(fill=tk.X, pady=(4, 0))
+        queue_var = tk.BooleanVar(value=False)
+        check = ttk.Checkbutton(
+            action_row,
+            text="Queue this fix for Apply all",
+            variable=queue_var,
+            command=self._update_apply_all_state,
+        )
+        check.pack(side=tk.LEFT)
+        ttk.Label(action_row, textvariable=status_var).pack(side=tk.LEFT, padx=(10, 0))
+        self._queue_vars[id(finding)] = queue_var
+        self._card_state[id(finding)] = {"check": check, "status_var": status_var}
+
+    def _update_apply_all_state(self) -> None:
+        n = sum(1 for var in self._queue_vars.values() if var.get())
+        if n == 0:
+            self.apply_all_btn.configure(state=tk.DISABLED, text="Apply all")
+        else:
+            self.apply_all_btn.configure(state=tk.NORMAL, text=f"Apply all ({n}) as one commit")
+
+    def _apply_all(self) -> None:
+        selected = [
+            f
+            for f in self._findings
+            if id(f) in self._queue_vars and self._queue_vars[id(f)].get()
+        ]
+        if not selected:
+            return
+
+        file_count = len(selected)
+        if not messagebox.askyesno(
+            "Apply all",
+            f"Apply {file_count} lint fix(es) as one commit to {self.diff.head_branch}?\n\n"
+            "This pushes directly to the PR branch and can't be undone from here.",
+            parent=self,
+        ):
+            return
+
+        self.apply_all_btn.configure(state=tk.DISABLED)
+        self.apply_all_status_var.set("Applying…")
+        for finding in selected:
+            state = self._card_state[id(finding)]
+            state["check"].configure(state=tk.DISABLED)
+            state["status_var"].set("Queued…")
+
+        def worker() -> None:
+            try:
+                apply_lint_fixes_batch(self.diff, selected, self.token)
+                self.after(0, lambda: self._apply_succeeded(selected))
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.after(0, lambda e=err: self._apply_failed(selected, e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_succeeded(self, findings: list[LintFinding]) -> None:
+        self.apply_all_status_var.set("Applied ✓")
+        for finding in findings:
+            self._card_state[id(finding)]["status_var"].set("Applied ✓")
+
+    def _apply_failed(self, findings: list[LintFinding], error: str) -> None:
+        for finding in findings:
+            state = self._card_state[id(finding)]
+            state["check"].configure(state=tk.NORMAL)
+            state["status_var"].set("")
+        self.apply_all_status_var.set("")
+        self._update_apply_all_state()
+        messagebox.showerror("Apply all failed", error, parent=self)
 
 
 class SubmitReviewDialog(tk.Toplevel):
@@ -893,6 +1385,21 @@ class SettingsDialog(tk.Toplevel):
             row=8, column=1, pady=4, sticky="ew"
         )
 
+        ttk.Label(frame, text="Review-comment triage model").grid(row=9, column=0, sticky="w")
+        self.cheap_model_var = tk.StringVar(
+            value=self.config_data.get("bot_cheap_model", "claude-haiku-4-5-20251001")
+        )
+        ttk.Entry(frame, textvariable=self.cheap_model_var, width=56).grid(
+            row=9, column=1, pady=4, sticky="ew"
+        )
+        ttk.Label(
+            frame,
+            text="Used only to triage bot/reviewer comments (valid/invalid) -- fix-drafting and "
+            "self-review still use the model above. Leave blank to use that model everywhere.",
+            justify=tk.LEFT,
+            foreground="#666",
+        ).grid(row=10, column=0, columnspan=2, sticky="w")
+
         help_text = (
             "GitHub browser login uses Git Credential Manager (opens a webpage only).\n"
             "Claude SSO login opens the browser via WSL — no extra terminal windows.\n"
@@ -900,16 +1407,16 @@ class SettingsDialog(tk.Toplevel):
             "Auth light status is saved and restored the next time you open the app."
         )
         ttk.Label(frame, text=help_text, justify=tk.LEFT).grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=(8, 0)
+            row=11, column=0, columnspan=2, sticky="w", pady=(8, 0)
         )
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=10, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        buttons.grid(row=12, column=0, columnspan=2, sticky="e", pady=(12, 0))
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=4)
         ttk.Button(buttons, text="Save", command=self._save).pack(side=tk.RIGHT)
 
         frame.columnconfigure(1, weight=1)
-        self.geometry("720x520")
+        self.geometry("720x560")
         self._restore_cached_auth_status()
         self.after(100, self._refresh_status)
 
@@ -1039,6 +1546,7 @@ class SettingsDialog(tk.Toplevel):
                 "anthropic_api_key": self.api_var.get().strip(),
                 "claude_model": self.model_var.get().strip()
                 or "claude-sonnet-4-20250514",
+                "bot_cheap_model": self.cheap_model_var.get().strip(),
             }
         )
         self.destroy()
@@ -1056,6 +1564,14 @@ class PeerReviewApp(tk.Tk):
         self._busy = False
         self._pending_history: dict | None = None
         self.notebook: ttk.Notebook | None = None
+
+        # Token usage: "call" is the most recent single run_claude() call,
+        # "job" resets at the start of each button press (a job may fire
+        # several calls, e.g. triage/fix/self-review per bot comment), and
+        # "session" accumulates for the lifetime of the running app.
+        self._call_usage = (0, 0)
+        self._job_usage = {"input": 0, "output": 0}
+        self._session_usage = {"input": 0, "output": 0}
 
         self._build_menu()
         notebook = ttk.Notebook(self)
@@ -1171,9 +1687,17 @@ class PeerReviewApp(tk.Tk):
         )
         self.ask_btn.pack(side=tk.LEFT, padx=(6, 0))
         self.bot_check_btn = ttk.Button(
-            action_row, text="Check bot comments", command=self.start_bot_check
+            action_row, text="Check review comments", command=self.start_bot_check
         )
         self.bot_check_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.merge_conflict_btn = ttk.Button(
+            action_row, text="Resolve merge conflict", command=self.start_merge_conflict_check
+        )
+        self.merge_conflict_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.lint_fix_btn = ttk.Button(
+            action_row, text="Fix lint", command=self.start_lint_check
+        )
+        self.lint_fix_btn.pack(side=tk.LEFT, padx=(6, 0))
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(action_row, textvariable=self.status_var).pack(side=tk.LEFT, padx=12)
         self.thinking = ThinkingIndicator(action_row)
@@ -1196,6 +1720,13 @@ class PeerReviewApp(tk.Tk):
             state=tk.DISABLED,
         )
         self.copy_selected_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        usage_row = ttk.Frame(tab)
+        usage_row.pack(fill=tk.X, pady=(0, 8))
+        self.usage_var = tk.StringVar(value="Tokens — last call: — · this run: — · session: —")
+        ttk.Label(
+            usage_row, textvariable=self.usage_var, foreground="#666"
+        ).pack(side=tk.LEFT)
 
         # Compact auth strip — lights + short labels; details on hover.
         auth_row = ttk.Frame(tab)
@@ -2067,14 +2598,18 @@ class PeerReviewApp(tk.Tk):
         config = load_config()
         self._busy = True
         self._set_run_buttons_enabled(False)
-        self.status_var.set("Checking for CodeRabbit / Amazon Q comments")
-        self.thinking.start("Checking bot comments")
+        self.status_var.set("Checking for CodeRabbit / Amazon Q and reviewer comments")
+        self.thinking.start("Checking review comments")
         self.diff_view.clear()
         self._clear_live_claude()
+        self._reset_job_usage()
         self._show_panel("live")
 
         def on_claude_event(event: dict) -> None:
             kind = str(event.get("kind") or "")
+            if kind == "usage":
+                self.after(0, lambda e=dict(event): self._record_usage(e))
+                return
             text = str(event.get("text") or "")
             self.after(0, lambda k=kind, t=text: self._append_live_claude(k, t))
 
@@ -2085,7 +2620,7 @@ class PeerReviewApp(tk.Tk):
                 )
                 self.after(
                     0,
-                    lambda d=diff, f=findings, t=token: self._bot_check_success(d, f, t),
+                    lambda d=diff, f=findings, t=token, c=config: self._bot_check_success(d, f, t, c),
                 )
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
@@ -2094,32 +2629,32 @@ class PeerReviewApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _bot_check_success(
-        self, diff: PullRequestDiff, findings: list[BotFinding], token: str
+        self, diff: PullRequestDiff, findings: list[BotFinding], token: str, config: dict
     ) -> None:
         self.thinking.stop()
         self._busy = False
         self._set_run_buttons_enabled(True)
         pr_ref = f"{diff.ref.full_name}#{diff.ref.number}"
         if not findings:
-            self.status_var.set(f"Done — no CodeRabbit/Amazon Q comments found on {pr_ref}.")
+            self.status_var.set(f"Done — no bot or reviewer comments found on {pr_ref}.")
             messagebox.showinfo(
-                "No bot comments",
-                f"No CodeRabbit or Amazon Q comments were found on {pr_ref}.",
+                "No comments found",
+                f"No CodeRabbit/Amazon Q comments or human reviewer feedback were found on {pr_ref}.",
             )
             return
         valid_count = sum(1 for f in findings if f.verdict.valid)
         self.status_var.set(
-            f"Done — {len(findings)} bot comment(s) on {pr_ref}, "
+            f"Done — {len(findings)} comment(s) on {pr_ref}, "
             f"{valid_count} valid. Review below."
         )
-        BotReviewDialog(self, diff=diff, findings=findings, token=token)
+        BotReviewDialog(self, diff=diff, findings=findings, token=token, config=config)
 
     def _bot_check_failure(self, error: str) -> None:
         self.thinking.stop()
         self._busy = False
         self._set_run_buttons_enabled(True)
         self.status_var.set("Failed")
-        messagebox.showerror("Bot comment check failed", error)
+        messagebox.showerror("Review comment check failed", error)
 
     def _set_run_buttons_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
@@ -2127,6 +2662,190 @@ class PeerReviewApp(tk.Tk):
         self.explain_btn.configure(state=state)
         self.ask_btn.configure(state=state)
         self.bot_check_btn.configure(state=state)
+        self.merge_conflict_btn.configure(state=state)
+        self.lint_fix_btn.configure(state=state)
+
+    def start_merge_conflict_check(self) -> None:
+        if self._busy:
+            return
+        url = self.pr_url_var.get().strip()
+        if not url:
+            messagebox.showerror("Missing PR", "Paste a GitHub PR URL.")
+            return
+        try:
+            parse_pr_url(url)
+        except ValueError as exc:
+            messagebox.showerror("Invalid URL", str(exc))
+            return
+
+        config = load_config()
+        self._busy = True
+        self._set_run_buttons_enabled(False)
+        self.status_var.set("Checking for merge conflicts")
+        self.thinking.start("Checking merge conflicts")
+        self.diff_view.clear()
+        self._clear_live_claude()
+        self._reset_job_usage()
+        self._show_panel("live")
+
+        def on_claude_event(event: dict) -> None:
+            kind = str(event.get("kind") or "")
+            if kind == "usage":
+                self.after(0, lambda e=dict(event): self._record_usage(e))
+                return
+            text = str(event.get("text") or "")
+            self.after(0, lambda k=kind, t=text: self._append_live_claude(k, t))
+
+        def worker() -> None:
+            session: ConflictSession | None = None
+            try:
+                token, _source = resolve_github_token(
+                    explicit_token=config.get("github_token") or "",
+                    use_wsl=bool(config.get("use_wsl_github_auth", True)),
+                )
+                on_claude_event({"kind": "status", "text": "fetching pull request"})
+                diff = fetch_pull_request(url, token=token)
+                info, session, conflicts = open_conflict_session(
+                    diff, token, on_event=on_claude_event
+                )
+                for i, conflict in enumerate(conflicts, start=1):
+                    if conflict.kind != "content":
+                        continue
+                    on_claude_event(
+                        {
+                            "kind": "status",
+                            "text": f"resolving conflict {i}/{len(conflicts)}: {conflict.path}",
+                        }
+                    )
+                    draft_resolution(diff, info, conflict, config, on_event=on_claude_event)
+                self.after(
+                    0,
+                    lambda d=diff, i=info, s=session, c=conflicts, tok=token: self._merge_conflict_success(
+                        d, i, s, c, tok, config
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                if session is not None:
+                    session.close()
+                err = str(exc)
+                self.after(0, lambda e=err: self._merge_conflict_failure(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _merge_conflict_success(
+        self,
+        diff: PullRequestDiff,
+        info: MergeabilityInfo,
+        session: ConflictSession | None,
+        conflicts: list[ConflictFile],
+        token: str,
+        config: dict,
+    ) -> None:
+        self.thinking.stop()
+        self._busy = False
+        self._set_run_buttons_enabled(True)
+        pr_ref = f"{diff.ref.full_name}#{diff.ref.number}"
+        if not info.has_conflicts:
+            state_notes = {
+                "clean": "no conflicts — this PR merges cleanly.",
+                "behind": "no conflicts — the PR branch is just behind the base branch.",
+                "unknown": "GitHub couldn't determine mergeability yet — try again in a moment.",
+                "blocked": "no merge conflicts, but the merge is blocked (branch protection rules).",
+                "unstable": "no merge conflicts (failing status checks).",
+                "draft": "no merge conflicts (this PR is a draft).",
+            }
+            note = state_notes.get(info.mergeable_state, f"mergeable_state={info.mergeable_state}")
+            self.status_var.set(f"Done — {pr_ref}: {note}")
+            messagebox.showinfo("No merge conflicts", f"{pr_ref}: {note}")
+            return
+        self.status_var.set(
+            f"Done — {len(conflicts)} conflicting file(s) on {pr_ref}. Review below."
+        )
+        assert session is not None
+        MergeConflictDialog(
+            self, diff=diff, info=info, session=session, conflicts=conflicts, token=token, config=config
+        )
+
+    def _merge_conflict_failure(self, error: str) -> None:
+        self.thinking.stop()
+        self._busy = False
+        self._set_run_buttons_enabled(True)
+        self.status_var.set("Failed")
+        messagebox.showerror("Merge conflict check failed", error)
+
+    def start_lint_check(self) -> None:
+        if self._busy:
+            return
+        url = self.pr_url_var.get().strip()
+        if not url:
+            messagebox.showerror("Missing PR", "Paste a GitHub PR URL.")
+            return
+        try:
+            parse_pr_url(url)
+        except ValueError as exc:
+            messagebox.showerror("Invalid URL", str(exc))
+            return
+
+        config = load_config()
+        self._busy = True
+        self._set_run_buttons_enabled(False)
+        self.status_var.set("Scanning changed files for lint issues")
+        self.thinking.start("Checking lint")
+        self.diff_view.clear()
+        self._clear_live_claude()
+        self._reset_job_usage()
+        self._show_panel("live")
+
+        def on_claude_event(event: dict) -> None:
+            kind = str(event.get("kind") or "")
+            if kind == "usage":
+                self.after(0, lambda e=dict(event): self._record_usage(e))
+                return
+            text = str(event.get("text") or "")
+            self.after(0, lambda k=kind, t=text: self._append_live_claude(k, t))
+
+        def worker() -> None:
+            try:
+                diff, findings, token = run_lint_check(
+                    pr_url=url, config=config, on_event=on_claude_event
+                )
+                self.after(
+                    0,
+                    lambda d=diff, f=findings, t=token: self._lint_check_success(d, f, t),
+                )
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.after(0, lambda e=err: self._lint_check_failure(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _lint_check_success(
+        self, diff: PullRequestDiff, findings: list[LintFinding], token: str
+    ) -> None:
+        self.thinking.stop()
+        self._busy = False
+        self._set_run_buttons_enabled(True)
+        pr_ref = f"{diff.ref.full_name}#{diff.ref.number}"
+        if not findings:
+            self.status_var.set(f"Done — no lint issues found on the changed lines in {pr_ref}.")
+            messagebox.showinfo(
+                "No lint issues found",
+                f"No lint/style issues were found on the lines changed in {pr_ref}.",
+            )
+            return
+        fixable_count = sum(1 for f in findings if f.fix is not None and f.safe)
+        self.status_var.set(
+            f"Done — {len(findings)} file(s) with lint issues on {pr_ref}, "
+            f"{fixable_count} with a fix ready. Review below."
+        )
+        LintFixDialog(self, diff=diff, findings=findings, token=token)
+
+    def _lint_check_failure(self, error: str) -> None:
+        self.thinking.stop()
+        self._busy = False
+        self._set_run_buttons_enabled(True)
+        self.status_var.set("Failed")
+        messagebox.showerror("Lint check failed", error)
 
     def _start_claude_job(self, *, mode: str) -> None:
         if self._busy:
@@ -2177,9 +2896,13 @@ class PeerReviewApp(tk.Tk):
         self._set_copy_buttons_enabled(False)
         self._show_panel("live")
         self._clear_live_claude()
+        self._reset_job_usage()
 
         def on_claude_event(event: dict) -> None:
             kind = str(event.get("kind") or "")
+            if kind == "usage":
+                self.after(0, lambda e=dict(event): self._record_usage(e))
+                return
             text = str(event.get("text") or "")
             self.after(0, lambda k=kind, t=text: self._append_live_claude(k, t))
 
@@ -2304,6 +3027,32 @@ class PeerReviewApp(tk.Tk):
         for i in range(0, len(ranges), 2):
             chunks.append(self.live_text.get(ranges[i], ranges[i + 1]))
         return "".join(chunks).strip()
+
+    def _reset_job_usage(self) -> None:
+        self._call_usage = (0, 0)
+        self._job_usage = {"input": 0, "output": 0}
+        self._update_usage_label()
+
+    def _record_usage(self, event: dict) -> None:
+        try:
+            input_tokens = int(event.get("input_tokens") or 0)
+            output_tokens = int(event.get("output_tokens") or 0)
+        except (TypeError, ValueError):
+            return
+        self._call_usage = (input_tokens, output_tokens)
+        self._job_usage["input"] += input_tokens
+        self._job_usage["output"] += output_tokens
+        self._session_usage["input"] += input_tokens
+        self._session_usage["output"] += output_tokens
+        self._update_usage_label()
+
+    def _update_usage_label(self) -> None:
+        call_in, call_out = self._call_usage
+        self.usage_var.set(
+            f"Tokens — last call: {call_in:,} in / {call_out:,} out   ·   "
+            f"this run: {self._job_usage['input']:,} in / {self._job_usage['output']:,} out   ·   "
+            f"session: {self._session_usage['input']:,} in / {self._session_usage['output']:,} out"
+        )
 
     def _append_live_claude(self, kind: str, text: str) -> None:
         if not text:
