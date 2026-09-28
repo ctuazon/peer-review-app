@@ -30,14 +30,73 @@ class ReviewComment:
         )
 
 
-_BLOCK_RE = re.compile(
-    r"FILE:\s*(?P<file>.+?)\s*\n"
-    r"LINE:\s*(?P<line>\d+|\?)\s*\n"
-    r"(?:SIDE:\s*(?P<side>RIGHT|LEFT)\s*\n)?"
-    r"(?:SEVERITY:\s*(?P<severity>\w+)\s*\n)?"
-    r"COMMENT:\s*\n(?P<comment>.*?)(?=\n---|\Z)",
-    re.IGNORECASE | re.DOTALL,
+# Each block starts at a FILE: line. Header fields after it may come in any
+# order, and the model sometimes folds line/side into FILE itself
+# ("FILE: a.php:48 · RIGHT" or "FILE: a.php:48 (RIGHT)").
+_FILE_RE = re.compile(r"(?im)^[ \t]*FILE:[ \t]*(?P<rest>.*?)[ \t]*$")
+_FIELD_RE = re.compile(r"(?i)^\s*(?P<key>LINE|SIDE|SEVERITY)\s*:\s*(?P<value>.*?)\s*$")
+_COMMENT_RE = re.compile(r"(?i)^\s*COMMENT\s*:\s*(?P<inline>.*)$")
+_INLINE_LOC_RE = re.compile(
+    r"^(?P<path>\S+?):(?P<line>\d+)"
+    r"(?:[\s·•|,\-(]*(?P<side>RIGHT|LEFT)\)?)?\s*$",
+    re.IGNORECASE,
 )
+_SEPARATOR_RE = re.compile(r"^\s*-{3,}\s*$")
+
+
+def _parse_block(file_rest: str, body: str) -> ReviewComment | None:
+    path = file_rest.strip().strip("`")
+    line: int | None = None
+    side = ""
+    severity = ""
+
+    loc = _INLINE_LOC_RE.match(path)
+    if loc:
+        path = loc.group("path")
+        line = int(loc.group("line"))
+        side = loc.group("side") or ""
+    if not path or any(ch.isspace() for ch in path):
+        return None
+
+    lines = body.split("\n")
+    idx = 0
+    comment_lines: list[str] = []
+    while idx < len(lines):
+        raw = lines[idx]
+        field = _FIELD_RE.match(raw)
+        if field:
+            key, value = field.group("key").upper(), field.group("value")
+            if key == "LINE":
+                line = int(value) if value.isdigit() else None
+            elif key == "SIDE" and value.upper() in ("RIGHT", "LEFT"):
+                side = value
+            elif key == "SEVERITY" and value:
+                severity = value.split()[0]
+            idx += 1
+            continue
+        comment = _COMMENT_RE.match(raw)
+        if comment:
+            if comment.group("inline").strip():
+                comment_lines.append(comment.group("inline"))
+            idx += 1
+            break
+        if not raw.strip():
+            idx += 1
+            continue
+        # No COMMENT: marker; treat the first non-field line as the body.
+        break
+    comment_lines.extend(lines[idx:])
+
+    while comment_lines and (not comment_lines[-1].strip() or _SEPARATOR_RE.match(comment_lines[-1])):
+        comment_lines.pop()
+
+    return ReviewComment(
+        file_path=path.removeprefix("./"),
+        line=line,
+        side=(side or "RIGHT").upper(),
+        severity=(severity or "nit").lower(),
+        comment="\n".join(comment_lines).strip(),
+    )
 
 
 def parse_review_comments(review_text: str) -> list[ReviewComment]:
@@ -45,19 +104,13 @@ def parse_review_comments(review_text: str) -> list[ReviewComment]:
     if not text:
         return []
 
+    headers = list(_FILE_RE.finditer(text))
     comments: list[ReviewComment] = []
-    for match in _BLOCK_RE.finditer(text):
-        line_raw = match.group("line").strip()
-        line = int(line_raw) if line_raw.isdigit() else None
-        comments.append(
-            ReviewComment(
-                file_path=match.group("file").strip().lstrip("./"),
-                line=line,
-                side=(match.group("side") or "RIGHT").strip().upper(),
-                severity=(match.group("severity") or "nit").strip().lower(),
-                comment=(match.group("comment") or "").strip(),
-            )
-        )
+    for i, header in enumerate(headers):
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+        parsed = _parse_block(header.group("rest"), text[header.end():end].lstrip("\n"))
+        if parsed is not None:
+            comments.append(parsed)
     return comments
 
 
@@ -82,6 +135,12 @@ def post_review_comment(
     general issue comment so they aren't silently dropped.
     """
     body = format_review_comment_body(comment)
+    diff_paths = {f.get("filename") for f in diff.files if f.get("filename")}
+    if diff_paths and comment.file_path not in diff_paths:
+        raise ValueError(
+            f"'{comment.file_path}' is not a file in this PR's diff, so GitHub can't anchor "
+            "a comment to it. Fix the FILE: path and re-parse."
+        )
     if comment.line is None:
         return post_issue_comment(diff.ref, f"**{comment.file_path}**\n\n{body}", token=token)
     return create_review_comment(
