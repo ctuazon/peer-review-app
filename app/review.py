@@ -40,15 +40,60 @@ COMMENT writing style (important):
 """.strip()
 
 
+# Cap how much prior-pass text is fed back so follow-ups don't blow the context.
+MAX_PRIOR_PASSES = 3
+MAX_PRIOR_CHARS = 40_000
+
+FOLLOW_UP_RULES = """
+This is a FOLLOW-UP review pass. The findings from earlier passes on this same PR are listed above.
+
+Follow-up rules (strict, these override "review everything"):
+1. Do NOT repeat, rephrase, or re-rank any issue already raised in a previous pass, even if it is still unfixed. Treat it as already reported.
+2. Only report NEW issues with SEVERITY: blocker or major. Do not emit minor or nit entries on a follow-up pass.
+3. If there are no new blocker/major issues, emit exactly ONE entry with SEVERITY: praise on a representative changed line saying no new blocking issues were found.
+""".strip()
+
+
+def _format_prior_reviews(prior_reviews: list[str]) -> str:
+    """Newest-first list of past review outputs -> one bounded prompt section."""
+    chunks: list[str] = []
+    used = 0
+    for index, text in enumerate(prior_reviews[:MAX_PRIOR_PASSES], start=1):
+        text = text.strip()
+        if not text:
+            continue
+        remaining = MAX_PRIOR_CHARS - used
+        if remaining <= 0:
+            break
+        if len(text) > remaining:
+            text = text[:remaining] + "\n…(truncated)"
+        chunks.append(f"=== Previous pass {index} ({'most recent' if index == 1 else 'older'}) ===\n{text}")
+        used += len(text)
+    return "\n\n".join(chunks)
+
+
 def build_review_prompt(
     *,
     reviewer_prompt: Prompt | None,
     story: str,
     diff: PullRequestDiff,
+    prior_reviews: list[str] | None = None,
 ) -> str:
     prompt_body = (reviewer_prompt.content if reviewer_prompt else "").strip()
     prompt_name = reviewer_prompt.name if reviewer_prompt else "Ad-hoc"
     story_text = story.strip() or "(No story/context provided.)"
+
+    prior_text = _format_prior_reviews(prior_reviews or [])
+    follow_up = (
+        f"""
+Findings already reported in previous review passes of this PR:
+{prior_text}
+
+{FOLLOW_UP_RULES}
+"""
+        if prior_text
+        else ""
+    )
 
     # SYSTEM_OUTPUT_CONTRACT is passed separately (see run_peer_review) so it
     # can be cached instead of being rebilled as input tokens on every call.
@@ -61,7 +106,7 @@ Story / acceptance criteria / context from the requester:
 
 Pull request under review:
 {summarize_diff_for_prompt(diff)}
-"""
+{follow_up}"""
 
 
 def run_peer_review(
@@ -71,6 +116,7 @@ def run_peer_review(
     reviewer_prompt: Prompt | None,
     config: dict[str, Any],
     on_claude_event: Callable[[dict[str, str]], None] | None = None,
+    prior_reviews: list[str] | None = None,
 ) -> tuple[PullRequestDiff, str]:
     token, auth_source = resolve_github_token(
         explicit_token=config.get("github_token") or "",
@@ -86,10 +132,19 @@ def run_peer_review(
                 "text": f"loaded {len(diff.files)} files — asking Claude",
             }
         )
+    if on_claude_event and prior_reviews:
+        count = min(len(prior_reviews), MAX_PRIOR_PASSES)
+        on_claude_event(
+            {
+                "kind": "status",
+                "text": f"follow-up pass: including {count} previous review(s), new blocker/major only",
+            }
+        )
     prompt = build_review_prompt(
         reviewer_prompt=reviewer_prompt,
         story=story,
         diff=diff,
+        prior_reviews=prior_reviews,
     )
     review = run_claude(prompt, config, on_event=on_claude_event, system=SYSTEM_OUTPUT_CONTRACT)
     # Stash auth source on the diff object for UI status (non-serialized helper).

@@ -88,6 +88,29 @@ def list_history() -> list[HistoryEntry]:
     return entries
 
 
+def pr_key(pr_url: str) -> str:
+    """Stable identity for a PR: 'owner/repo#number', lowercased. '' if unparseable."""
+    from app.github_pr import parse_pr_url
+
+    try:
+        ref = parse_pr_url(pr_url or "")
+    except ValueError:
+        return ""
+    return f"{ref.full_name.lower()}#{ref.number}"
+
+
+def list_reviews_for_pr(pr_url: str) -> list[HistoryEntry]:
+    """Past peer-review runs for the same repo + PR number, newest first."""
+    key = pr_key(pr_url)
+    if not key:
+        return []
+    return [
+        e
+        for e in list_history()
+        if e.mode == "review" and e.result and pr_key(e.pr_url) == key
+    ]
+
+
 def get_history_entry(entry_id: str) -> HistoryEntry | None:
     for entry in list_history():
         if entry.id == entry_id:

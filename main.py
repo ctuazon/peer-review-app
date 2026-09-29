@@ -31,6 +31,7 @@ from app.history_store import (
     delete_history_entry,
     get_history_entry,
     list_history,
+    list_reviews_for_pr,
 )
 from app.lint_fix import LintFinding, apply_lint_fixes_batch, run_lint_check
 from app.merge_conflict import (
@@ -1671,6 +1672,21 @@ class PeerReviewApp(tk.Tk):
         self.story_text = scrolledtext.ScrolledText(story_box, height=4, wrap=tk.WORD)
         self.story_text.pack(fill=tk.BOTH, expand=True)
 
+        follow_row = ttk.Frame(tab)
+        follow_row.pack(fill=tk.X, pady=(6, 0))
+        self.follow_up_var = tk.BooleanVar(value=True)
+        self.follow_up_check = ttk.Checkbutton(
+            follow_row,
+            text="Follow-up pass: skip already-reported findings, new blocker/major only",
+            variable=self.follow_up_var,
+        )
+        self.follow_up_check.pack(side=tk.LEFT)
+        self.follow_up_info_var = tk.StringVar(value="")
+        ttk.Label(
+            follow_row, textvariable=self.follow_up_info_var, foreground="#666"
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        self.pr_url_var.trace_add("write", lambda *_: self._refresh_follow_up_info())
+
         # Primary actions — keep this row sparse.
         action_row = ttk.Frame(tab)
         action_row.pack(fill=tk.X, pady=(10, 2))
@@ -2576,6 +2592,14 @@ class PeerReviewApp(tk.Tk):
     def start_review(self) -> None:
         self._start_claude_job(mode="review")
 
+    def _refresh_follow_up_info(self) -> None:
+        url = self.pr_url_var.get().strip()
+        count = len(list_reviews_for_pr(url)) if url else 0
+        if count:
+            self.follow_up_info_var.set(f"({count} previous review(s) of this PR in history)")
+        else:
+            self.follow_up_info_var.set("(no previous reviews of this PR yet)" if url else "")
+
     def start_explain(self) -> None:
         self._start_claude_job(mode="explain")
 
@@ -2872,6 +2896,9 @@ class PeerReviewApp(tk.Tk):
 
         prompt = self.cycler.current
         config = load_config()
+        prior_reviews: list[str] = []
+        if mode == "review" and self.follow_up_var.get():
+            prior_reviews = [e.result for e in list_reviews_for_pr(url)]
         self._pending_history = {
             "mode": mode,
             "pr_url": url,
@@ -2969,6 +2996,7 @@ class PeerReviewApp(tk.Tk):
                         reviewer_prompt=prompt,
                         config=config,
                         on_claude_event=on_claude_event,
+                        prior_reviews=prior_reviews,
                     )
                     auth_source = getattr(diff, "auth_source", "unknown")
                     summary = [
@@ -2976,6 +3004,11 @@ class PeerReviewApp(tk.Tk):
                         f"Files changed: {len(diff.files)}",
                         f"Auth: {auth_source}",
                         f"Prompt: {prompt.name if prompt else '(none)'}",
+                        (
+                            f"Pass: follow-up ({len(prior_reviews)} previous, new blocker/major only)"
+                            if prior_reviews
+                            else "Pass: full review"
+                        ),
                     ]
                     self.after(
                         0,
@@ -3103,6 +3136,7 @@ class PeerReviewApp(tk.Tk):
                 summary_lines=summary_lines or [],
             )
             self.refresh_history_ui()
+            self._refresh_follow_up_info()
         except Exception:  # noqa: BLE001
             # History must never break the main review flow.
             pass
