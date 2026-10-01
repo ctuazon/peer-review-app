@@ -61,13 +61,6 @@ def list_prompts() -> list[Prompt]:
     return [Prompt.from_dict(item) for item in _load_raw()["prompts"]]
 
 
-def get_prompt(prompt_id: str) -> Prompt | None:
-    for prompt in list_prompts():
-        if prompt.id == prompt_id:
-            return prompt
-    return None
-
-
 def save_all(prompts: list[Prompt]) -> None:
     save_json(PROMPTS_PATH, {"prompts": [p.to_dict() for p in prompts]})
 
@@ -164,14 +157,6 @@ def move_prompt_to_index(prompt_id: str, new_index: int) -> list[Prompt]:
     prompts.insert(new_index, prompt)
     save_all(prompts)
     return prompts
-
-
-def infer_repo_type(repo_name: str) -> str:
-    """Best-effort map from repo name to a prompt repo_type key."""
-    name = repo_name.lower()
-    # Prefer exact prompt matches later; this is only a hint for filtering.
-    tokens = re_split_tokens(name)
-    return tokens[0] if tokens else GENERIC_REPO_TYPE
 
 
 def re_split_tokens(name: str) -> list[str]:

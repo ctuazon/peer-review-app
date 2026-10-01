@@ -108,15 +108,47 @@ def select_diffs(
     return selection
 
 
+def _not_shown(selection: DiffSelection) -> str:
+    if not selection.omitted:
+        return ""
+    rows = "\n".join(f"- {p} ({why})" for p, why in selection.omitted.items())
+    return (
+        "\n\n# Not shown\n\nThese files changed but their diff is not above. If you can read the "
+        "repository, read one when a finding depends on it; otherwise do not guess about it. "
+        "Never read or quote a file withheld as secret-bearing.\n\n" + rows
+    )
+
+
 def render_selected(diffs: dict[str, FileDiff], selection: DiffSelection) -> str:
     """Annotated diff of the shown files, plus a 'not shown' list."""
     parts = [diffs[p].annotated() for p in selection.shown]
     text = "\n\n".join(parts) if parts else "(no reviewable diff)"
-    if selection.omitted:
-        rows = "\n".join(f"- {p} ({why})" for p, why in selection.omitted.items())
-        text += (
-            "\n\n# Not shown\n\nThese files changed but their diff is not above. If you can read the "
-            "repository, read one when a finding depends on it; otherwise do not guess about it. "
-            "Never read or quote a file withheld as secret-bearing.\n\n" + rows
-        )
-    return text
+    return text + _not_shown(selection)
+
+
+def review_delta(
+    since_diffs: dict[str, FileDiff] | None, diffs: dict[str, FileDiff], selection: DiffSelection
+) -> dict[str, FileDiff] | None:
+    """On a re-review, what changed since the last reviewed commit in the
+    files the review would show, or None to send the full diff instead (the
+    old commit is gone, or the delta is no smaller, e.g. after a base merge)."""
+    if since_diffs is None:
+        return None
+    delta = {p: since_diffs[p] for p in selection.shown if p in since_diffs}
+    delta_size = sum(len(d.annotated()) for d in delta.values())
+    full_size = sum(len(diffs[p].annotated()) for p in selection.shown)
+    return delta if delta_size < full_size else None
+
+
+def render_delta(delta: dict[str, FileDiff], selection: DiffSelection, since_sha: str) -> str:
+    """The re-review diff: only the changes since `since_sha`."""
+    unchanged = [p for p in selection.shown if p not in delta]
+    text = (
+        f"Only what changed since {since_sha[:7]}, the commit you last reviewed, is shown; the rest of "
+        "the pull request was reviewed then. `L` numbers here are against that commit, so anchor new "
+        "findings to `R` lines only.\n\n"
+        + ("\n\n".join(d.annotated() for d in delta.values()) or "(none of the reviewed files changed)")
+    )
+    if unchanged:
+        text += "\n\n# Unchanged since your last review\n\n" + "\n".join(f"- {p}" for p in unchanged)
+    return text + _not_shown(selection)

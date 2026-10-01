@@ -6,7 +6,6 @@ simpler single-prompt runs at the bottom.
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -44,7 +43,7 @@ from app.context import (
 )
 from app.cost import estimate_cost, estimate_tokens
 from app.diff_model import FileDiff, build_file_diffs
-from app.diff_select import DiffSelection, render_selected, select_diffs
+from app.diff_select import DiffSelection, render_delta, render_selected, review_delta, select_diffs
 from app.eligibility import eligibility_warnings
 from app.github_pr import PullRequestDiff, fetch_pull_request, get_file_text, summarize_diff_for_prompt
 from app.globs import matches
@@ -76,10 +75,6 @@ from app.secrets_scan import SecretFinding, mask_diffs, mask_text, render_findin
 from app.wsl_auth import resolve_github_token
 
 EventFn = Callable[[dict[str, str]], None]
-
-# Cap how much legacy (pre-JSON) prior-pass text is fed back.
-MAX_PRIOR_PASSES = 3
-MAX_PRIOR_CHARS = 40_000
 
 
 @dataclass
@@ -117,7 +112,9 @@ class ReviewPrep:
     prior: PriorState  # always loaded: the double-post guard and supersede need it
     re_review: bool
     since: SinceLastReview | None
-    legacy_prior: list[str]
+    # Re-review only: the changes since the last pass, sent instead of the full diff.
+    delta: dict[str, FileDiff] | None
+    review_lines: int
     path_instructions: list[tuple[list[str], str]]
     warnings: list[str]
     notes: list[str] = field(default_factory=list)
@@ -163,7 +160,9 @@ class ReviewPrep:
             self.security if self.security else "The Dependabot scan is unavailable (the token can't read alerts), not clean."
         )
         previous = ""
-        if self.re_review and self.prior.own_review_body:
+        # The findings list carries what a re-review needs; the old body only
+        # matters when there are no fingerprinted findings to go on.
+        if self.re_review and self.prior.own_review_body and not self.prior.findings:
             previous = mask_text(self.prior.own_review_body)[:20_000]
         tickets = format_tickets_for_prompt(self.tickets) if (self.tickets or self.ticket_keys) else (
             "No Jira ticket was loaded for this pull request. Judge it against its own stated intent."
@@ -188,9 +187,13 @@ class ReviewPrep:
             other_reviewers=render_other_comments(self.others),
             previous_review=previous,
             own_findings=render_own_findings(self.prior.findings, self.since) if self.re_review else "",
-            since_last=self.since.render() if (self.re_review and self.since) else "",
-            legacy_prior=_format_prior_reviews(self.legacy_prior) if self.re_review else "",
-            diff=render_selected(self.masked_diffs, self.selection),
+            since_last=self.since.render() if (self.re_review and self.since and self.delta is None) else "",
+            diff=(
+                render_selected(self.masked_diffs, self.selection)
+                if self.delta is None or self.since is None
+                else render_delta(self.delta, self.selection, self.since.base_sha)
+            ),
+            delta_only=self.delta is not None,
         )
         self.est_tokens = estimate_tokens(self.parts.combined())
         self.counted = False
@@ -216,23 +219,6 @@ def fill_template(text: str, **values: str) -> str:
     for name, value in values.items():
         text = text.replace("{{" + name + "}}", value)
     return text
-
-
-def _format_prior_reviews(prior_reviews: list[str]) -> str:
-    chunks: list[str] = []
-    used = 0
-    for index, text in enumerate(prior_reviews[:MAX_PRIOR_PASSES], start=1):
-        text = (text or "").strip()
-        if not text:
-            continue
-        remaining = MAX_PRIOR_CHARS - used
-        if remaining <= 0:
-            break
-        if len(text) > remaining:
-            text = text[:remaining] + "\n…(truncated)"
-        chunks.append(f"=== Previous pass {index} ({'most recent' if index == 1 else 'older'}) ===\n{text}")
-        used += len(text)
-    return "\n\n".join(chunks)
 
 
 def _status(on_event: EventFn | None, text: str) -> None:
@@ -274,21 +260,6 @@ def prepare_review(
     masked = mask_diffs(file_diffs)
     selection = select_diffs(masked, exclude_globs=repo_cfg.exclude_globs)
 
-    settings = resolve_settings(
-        repo_cfg,
-        paths=diff.paths,
-        author=diff.author,
-        changed_lines=diff.additions + diff.deletions,
-        draft=diff.draft,
-        desktop={
-            "model": config.get("claude_model"),
-            "effort": config.get("review_effort"),
-            "mode": config.get("review_mode"),
-            "verify": config.get("verify_findings"),
-        },
-        overrides={"model": options.model, "effort": options.effort, "mode": options.mode, "verify": options.verify},
-    )
-
     _status(on_event, f"loaded {len(diff.files)} files, gathering context")
     conventions = load_conventions(diff, token)
     tickets, keys, jira_note = fetch_pr_tickets(config, title=diff.title, body=diff.body, head_branch=diff.head_branch)
@@ -302,12 +273,31 @@ def prepare_review(
     newest_structured = next((e for e in entries if getattr(e, "review", None)), None)
     if newest_structured is not None:
         merge_history_findings(prior, newest_structured.review.get("findings") or [], newest_structured.head_sha)
-    last_sha = prior.last_sha or next((e.head_sha for e in entries if getattr(e, "head_sha", "")), "")
+    last_sha = prior.last_sha or (newest_structured.head_sha if newest_structured is not None else "")
     if not prior.last_sha:
         prior.last_sha = last_sha
-    legacy = [e.result for e in entries if not getattr(e, "review", None) and e.result]
-    re_review = options.follow_up and (prior.is_re_review or bool(legacy))
+    re_review = options.follow_up and prior.is_re_review
     since = load_since_last(diff, last_sha, token) if re_review else None
+    delta = review_delta(since.diffs, masked, selection) if since is not None else None
+    sent = delta if delta is not None else {p: masked[p] for p in selection.shown}
+    review_lines = sum(d.changed_lines for d in sent.values())
+
+    settings = resolve_settings(
+        repo_cfg,
+        paths=diff.paths,
+        author=diff.author,
+        changed_lines=diff.additions + diff.deletions,
+        draft=diff.draft,
+        desktop={
+            "model": config.get("claude_model"),
+            "effort": config.get("review_effort"),
+            "mode": config.get("review_mode"),
+            "verify": config.get("verify_findings"),
+            "size_tiers": config.get("review_size_tiers") if config.get("review_by_size") else None,
+        },
+        overrides={"model": options.model, "effort": options.effort, "mode": options.mode, "verify": options.verify},
+        review_lines=review_lines,
+    )
 
     path_instructions: list[tuple[list[str], str]] = []
     rules = [(pi.path, pi.instructions) for pi in repo_cfg.path_instructions]
@@ -336,7 +326,7 @@ def prepare_review(
         selection=selection, secrets=secrets, repo_cfg=repo_cfg, settings=settings,
         reviewer_prompt=reviewer_prompt, story=story, conventions=conventions, tickets=tickets,
         ticket_keys=keys, jira_note=jira_note, ci=ci, history=history, security=security or "",
-        others=others, prior=prior, re_review=re_review, since=since, legacy_prior=legacy,
+        others=others, prior=prior, re_review=re_review, since=since, delta=delta, review_lines=review_lines,
         path_instructions=path_instructions, warnings=warnings, notes=notes,
         agentic_available=agentic_available,
     )
@@ -533,23 +523,6 @@ def verify_findings(
     return f"Verifier rejected {rejected} finding(s)." if rejected else "Verifier confirmed every finding."
 
 
-def run_peer_review(
-    *,
-    pr_url: str,
-    story: str,
-    reviewer_prompt: Prompt | None,
-    config: dict[str, Any],
-    on_claude_event: EventFn | None = None,
-    options: ReviewOptions | None = None,
-    history_entries: list[Any] | None = None,
-) -> ReviewRun:
-    prep = prepare_review(
-        pr_url=pr_url, story=story, reviewer_prompt=reviewer_prompt, config=config,
-        options=options, history_entries=history_entries, on_event=on_claude_event,
-    )
-    return execute_review(prep, config, on_claude_event)
-
-
 def review_summary_lines(run: ReviewRun) -> list[str]:
     prep, result = run.prep, run.result
     diff = prep.diff
@@ -560,7 +533,8 @@ def review_summary_lines(run: ReviewRun) -> list[str]:
         f"Files changed: {len(diff.files)} · shown {len(prep.selection.shown)}, withheld {len(prep.selection.omitted)}",
         f"Model: {prep.settings.model} · effort {prep.settings.effort} · {'agentic' if prep.agentic else 'single-shot'} · tier {prep.settings.tier}",
         f"Prompt: {prep.reviewer_prompt.name if prep.reviewer_prompt else '(none)'}",
-        ("Pass: re-review since " + (prep.prior.last_sha[:7] or "an earlier pass")) if prep.re_review else "Pass: full review",
+        ("Pass: re-review since " + (prep.prior.last_sha[:7] or "an earlier pass")
+         + (", changes only" if prep.delta is not None else "")) if prep.re_review else "Pass: full review",
         f"Auth: {prep.auth_source}",
     ]
     if run.cost_usd is not None:
@@ -600,6 +574,8 @@ def inspect_report(prep: ReviewPrep) -> str:
         + (f", {len(prep.prior.findings)} earlier finding(s)" if prep.re_review else ""),
         f"Secret scan hits: {len(prep.secrets)}",
         f"Files shown: {len(prep.selection.shown)}",
+        f"Diff sent: {'changes since ' + prep.since.base_sha[:7] if prep.delta is not None and prep.since else 'full'}"
+        f" ({prep.review_lines:,} changed lines)",
         "Withheld:",
         *([f"  {p} ({why})" for p, why in prep.selection.omitted.items()] or ["  none"]),
         "Path instructions:",
@@ -750,7 +726,3 @@ def review_to_history(run: ReviewRun) -> dict[str, Any]:
     data = run.result.to_dict()
     data["parse_mode"] = run.result.parse_mode
     return data
-
-
-def result_json(run: ReviewRun) -> str:
-    return json.dumps(run.result.to_dict(), indent=2)

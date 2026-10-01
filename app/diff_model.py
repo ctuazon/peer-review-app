@@ -146,13 +146,10 @@ class FileDiff:
     def accepts(self, line: int | None, side: str = "RIGHT") -> bool:
         return line is not None and line in self.commentable_lines(side)
 
-    def added_lines(self) -> list[int]:
-        return [
-            ln.new_line
-            for hunk in self.hunks
-            for ln in hunk.lines
-            if ln.origin == "+" and ln.new_line is not None
-        ]
+    @property
+    def changed_lines(self) -> int:
+        """Added plus deleted lines, the size the review model is picked by."""
+        return sum(1 for hunk in self.hunks for ln in hunk.lines if ln.origin in ("+", "-"))
 
     def right_lines(self, start: int, end: int) -> list[str] | None:
         """Text of RIGHT lines start..end, or None if any is outside the diff."""

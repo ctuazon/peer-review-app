@@ -32,6 +32,16 @@ DEFAULT_CONFIG = {
     "jira_api_token": "",
     # Peer review defaults; .github/pr-review.yml and the review tab override.
     "review_effort": "medium",
+    # Pick the review model and effort by how many changed lines the model is
+    # sent (on a re-review, just the lines changed since the last pass). The
+    # first tier whose max_lines covers it wins; null covers anything. Off,
+    # claude_model and review_effort apply to every review.
+    "review_by_size": True,
+    "review_size_tiers": [
+        {"name": "small", "max_lines": 300, "model": "claude-sonnet-5-5", "effort": "low"},
+        {"name": "medium", "max_lines": 1500, "model": "claude-sonnet-5-5", "effort": "medium"},
+        {"name": "large", "max_lines": None, "model": "claude-opus-5-5", "effort": "medium"},
+    ],
     "review_mode": "agentic",  # agentic (local checkout + Read/Grep/Glob) | single-shot
     "verify_findings": False,
     "claude_timeout_minutes": 15,

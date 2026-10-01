@@ -44,11 +44,6 @@ class JiraSettings:
     def configured(self) -> bool:
         return bool(self.base_url and self.email and self.api_token)
 
-    @property
-    def active(self) -> bool:
-        return self.enabled and self.configured
-
-
 @dataclass
 class JiraTicket:
     key: str

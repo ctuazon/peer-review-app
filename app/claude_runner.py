@@ -524,23 +524,6 @@ def run_claude_cli_result(
             pass
 
 
-def run_claude_wsl(
-    prompt: str,
-    on_event: ClaudeEventCallback | None = None,
-    model: str | None = None,
-) -> str:
-    return run_claude_wsl_result(prompt, on_event, CliOptions(model=model)).text
-
-
-def run_claude_cli(
-    prompt: str,
-    cli_path: str = "claude",
-    on_event: ClaudeEventCallback | None = None,
-    model: str | None = None,
-) -> str:
-    return run_claude_cli_result(prompt, cli_path, on_event, CliOptions(model=model)).text
-
-
 # --- API mode ----------------------------------------------------------------
 
 def _api_client(api_key: str):
@@ -698,25 +681,6 @@ def count_tokens_api(
     kwargs = api_request_kwargs(model=model, system_blocks=system_blocks, user_blocks=user_blocks)
     count_kwargs = {k: kwargs[k] for k in ("model", "messages", "system", "thinking") if k in kwargs}
     return int(client.messages.count_tokens(**count_kwargs).input_tokens)
-
-
-def run_claude_api(
-    prompt: str,
-    api_key: str,
-    model: str = DEFAULT_REVIEW_MODEL,
-    on_event: ClaudeEventCallback | None = None,
-    system: str | None = None,
-) -> str:
-    # Cache the (constant, often large) instruction text as its own block:
-    # Anthropic reuses it across calls that repeat this exact prefix instead
-    # of rebilling it as fresh input tokens every time.
-    return run_claude_api_result(
-        api_key=api_key,
-        model=model,
-        system_blocks=[(system, True)] if system else None,
-        user_blocks=[(prompt, False)],
-        on_event=on_event,
-    ).text
 
 
 def _timeout(config: dict[str, Any]) -> float:

@@ -6,7 +6,8 @@ Laravel parser, each key is validated on its own: one bad key is reported and
 ignored, the rest still apply.
 
 Precedence for every setting: UI override, then pr-review.yml (a matching
-tier, then `defaults`), then the desktop defaults. `ResolvedSettings.sources`
+tier, then `defaults`), then the desktop defaults, whose model and effort can
+follow the PR's size (`review_size_tiers`). `ResolvedSettings.sources`
 records where each value came from, for the Inspect view.
 """
 from __future__ import annotations
@@ -15,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.cost import DEFAULT_EFFORT, DEFAULT_REVIEW_MODEL, EFFORTS, model_info
-from app.globs import matches, matches_any
+from app.globs import matches_any
 from app.review_schema import SEVERITIES
 
 CONFIG_PATH = ".github/pr-review.yml"
@@ -30,9 +31,6 @@ DEFAULT_FOLLOW_UP_FLOOR = "major"
 class PathInstruction:
     path: str
     instructions: str
-
-    def matching(self, paths: list[str]) -> list[str]:
-        return [p for p in paths if matches(self.path, p)]
 
 
 @dataclass
@@ -250,6 +248,23 @@ class ResolvedSettings:
     sources: dict[str, str] = field(default_factory=dict)
 
 
+def pick_size_tier(tiers: Any, lines: int) -> dict[str, Any] | None:
+    """The first desktop size tier whose max_lines covers `lines` (a null
+    max_lines covers anything). Entries with an unknown model or effort are
+    skipped rather than half-applied."""
+    if not isinstance(tiers, list):
+        return None
+    for tier in tiers:
+        if not isinstance(tier, dict) or model_info(str(tier.get("model") or "")) is None:
+            continue
+        if tier.get("effort") not in EFFORTS:
+            continue
+        limit = tier.get("max_lines")
+        if limit is None or (isinstance(limit, int) and lines <= limit):
+            return tier
+    return None
+
+
 def resolve_settings(
     cfg: RepoConfig,
     *,
@@ -259,8 +274,12 @@ def resolve_settings(
     draft: bool,
     desktop: dict[str, Any],
     overrides: dict[str, Any] | None = None,
+    review_lines: int = 0,
 ) -> ResolvedSettings:
-    """Merge desktop defaults < yml defaults < matching tier < UI overrides."""
+    """Merge desktop defaults < yml defaults < matching tier < UI overrides.
+
+    With desktop["size_tiers"], the desktop model and effort come from the
+    tier matching `review_lines` (the changed lines the model will be sent)."""
     out = ResolvedSettings()
     values: dict[str, tuple[Any, str]] = {
         "model": (desktop.get("model") or DEFAULT_REVIEW_MODEL, "desktop"),
@@ -268,6 +287,12 @@ def resolve_settings(
         "mode": (desktop.get("mode") or "agentic", "desktop"),
         "verify": (bool(desktop.get("verify", False)), "desktop"),
     }
+    size = pick_size_tier(desktop.get("size_tiers"), review_lines)
+    if size is not None:
+        out.tier = str(size.get("name") or "sized")
+        where = f"desktop size tier '{out.tier}' ({review_lines} lines)"
+        values["model"] = (size["model"], where)
+        values["effort"] = (size["effort"], where)
     for key in ("model", "effort", "mode"):
         if key in cfg.defaults:
             values[key] = (cfg.defaults[key], "pr-review.yml defaults")

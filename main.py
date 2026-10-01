@@ -235,7 +235,10 @@ class PeerReviewApp(PromptsTabMixin, HistoryTabMixin, tk.Tk):
         self.effort_var = tk.StringVar(value="auto")
         self.mode_choice_var = tk.StringVar(value="auto")
         self.verify_var = tk.StringVar(value="auto")
-        auto_note = "auto = the repo's .github/pr-review.yml, then the defaults in File > Settings."
+        auto_note = (
+            "auto = the repo's .github/pr-review.yml, then the defaults in File > Settings "
+            "(which can pick the model and effort by PR size)."
+        )
         settings = [
             ("Model", self.model_choice_var, ["auto", *REVIEW_MODEL_CHOICES], 18,
              "Claude model for this run. " + auto_note),
@@ -424,9 +427,6 @@ class PeerReviewApp(PromptsTabMixin, HistoryTabMixin, tk.Tk):
             LinkButton(right, self.open_settings, text="Settings"),
             "Tokens, sign-in options, review defaults and Jira settings.",
         ).pack(side=tk.LEFT, padx=(8, 0))
-
-        # Kept for compatibility with older restore/update helpers.
-        self.auth_status_var = tk.StringVar(value="")
 
     def _update_advanced_summary(self) -> None:
         """Show overrides next to the collapsed header so they aren't hidden."""
@@ -625,8 +625,6 @@ class PeerReviewApp(PromptsTabMixin, HistoryTabMixin, tk.Tk):
                 self.status_var.set("GitHub sign-in needed")
             else:
                 self.status_var.set("Claude sign-in needed")
-
-        self.auth_status_var.set("")
 
         if persist and github_known and claude_known:
             save_auth_status(
@@ -1391,13 +1389,6 @@ class PeerReviewApp(PromptsTabMixin, HistoryTabMixin, tk.Tk):
         self.live_text.configure(state=tk.NORMAL)
         self.live_text.delete("1.0", tk.END)
         self.live_text.configure(state=tk.DISABLED)
-
-    def _show_live_claude(self) -> None:
-        self._clear_live_claude()
-        self._show_panel("live")
-
-    def _hide_live_claude(self) -> None:
-        self._show_panel("diff")
 
     def _live_streamed_answer(self) -> str:
         """Collect green answer text that was streamed into the live panel."""

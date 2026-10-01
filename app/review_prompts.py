@@ -116,7 +116,7 @@ SINGLE_SHOT = (
 )
 
 RE_REVIEW = """
-This is a RE-REVIEW: you reviewed an earlier commit of this pull request. When shown, `# Changed since your last review` is the delta since the commit you reviewed: start there, and use the full diff as context for judging whether a fix holds.
+This is a RE-REVIEW: you reviewed an earlier commit of this pull request. When the diff below is only what changed since that commit, raise new findings only on those changes, and judge a prior finding in an unchanged file as still `open` unless you read the file and it is fixed. When the full diff is shown with a `# Changed since your last review` section, start at that section and use the full diff as context for judging whether a fix holds.
 
 Report the status of **every** earlier finding in `prior_findings`, and do not re-raise anything already fixed. Your own earlier findings are listed under `# Your findings from earlier passes`, each with a fingerprint: copy it exactly into `fp`, because the thread is matched by fingerprint, not title. Leave `fp` null for a finding another reviewer raised, set `raised_by` to them, and give `file` and `line` (the location their comment was anchored to), because their thread is matched only by location.
 
@@ -244,8 +244,8 @@ def build_review_parts(
     previous_review: str = "",
     own_findings: str = "",
     since_last: str = "",
-    legacy_prior: str = "",
     diff: str,
+    delta_only: bool = False,
 ) -> PromptParts:
     system = [SystemBlock(RUBRIC, cache=True)]
     if focus_prompt.strip():
@@ -283,13 +283,12 @@ def build_review_parts(
                 + own_findings,
             )
         )
-    if legacy_prior.strip():
-        user.append(block("# Your earlier review text (older format, no fingerprints)", legacy_prior))
     if since_last.strip():
         user.append(block("# Changed since your last review (untrusted)", since_last))
+    heading = "# Changed since your last review (untrusted)" if delta_only else "# The diff (untrusted)"
     user.append(
         SystemBlock(
-            "# The diff (untrusted)\n\nLine numbers are given against every line: `R` is the right-hand side, `L` the left. "
+            heading + "\n\nLine numbers are given against every line: `R` is the right-hand side, `L` the left. "
             "Anchor findings to exactly these.\n\n" + diff,
             cache=True,
         )

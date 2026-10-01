@@ -26,11 +26,6 @@ class PullRequestRef:
     def full_name(self) -> str:
         return f"{self.owner}/{self.repo}"
 
-    @property
-    def repo_slug(self) -> str:
-        return self.repo.lower()
-
-
 @dataclass
 class ChangedLine:
     file_path: str
@@ -441,28 +436,6 @@ def post_issue_comment(ref: PullRequestRef, body: str, token: str = "") -> dict[
     base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
     resp = requests.post(
         f"{base}/issues/{ref.number}/comments", headers=headers, json={"body": body}, timeout=30
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def create_review_comment(
-    ref: PullRequestRef,
-    commit_id: str,
-    path: str,
-    line: int,
-    side: str,
-    body: str,
-    token: str = "",
-) -> dict[str, Any]:
-    """Post a new inline (line-anchored) review comment on the PR's diff."""
-    headers = _headers(token)
-    base = f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
-    resp = requests.post(
-        f"{base}/pulls/{ref.number}/comments",
-        headers=headers,
-        json={"commit_id": commit_id, "path": path, "line": line, "side": side, "body": body},
-        timeout=30,
     )
     resp.raise_for_status()
     return resp.json()

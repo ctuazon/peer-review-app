@@ -13,7 +13,7 @@ from app.review_parse import (
     comments_to_copy_text,
     parse_review_comments,
 )
-from app.review_schema import ReviewResult, parse_review_output
+from app.review_schema import ReviewResult
 from ui.widgets import Tooltip, tip
 
 VERDICT_STYLES = {
@@ -190,26 +190,10 @@ class CollapsiblePanel(ttk.Frame):
             return HEADER_STYLES[self._severity]
         return HEADER_STYLES["review"]
 
-    def set_review_style(self, *, has_review: bool, severity: str | None = None) -> None:
-        self._has_review = has_review
-        self._severity = (severity or "").lower() or None
-        style = self._resolve_style()
-        for widget in (self.header, self.arrow, self.title_label):
-            widget.configure(background=style["bg"])
-        self.arrow.configure(foreground=style["fg"])
-        self.title_label.configure(foreground=style["fg"])
-
     def _header_text(self) -> str:
         if self._subtitle:
             return f"{self._title}   {self._subtitle}"
         return self._title
-
-    def set_meta(self, *, title: str | None = None, subtitle: str | None = None) -> None:
-        if title is not None:
-            self._title = title
-        if subtitle is not None:
-            self._subtitle = subtitle
-        self._title_var.set(self._header_text())
 
     @property
     def title(self) -> str:
@@ -552,19 +536,6 @@ class DiffReviewView(ttk.Frame):
             except tk.TclError:
                 continue
         return ""
-
-    def render(
-        self,
-        *,
-        diff: PullRequestDiff,
-        review_text: str,
-        summary_lines: Iterable[str] | None = None,
-    ) -> None:
-        """Legacy entry point: parse text (JSON or FILE:/LINE: blocks) and render."""
-        self.render_result(diff=diff, result=parse_review_output(review_text), summary_lines=summary_lines)
-
-    def get_result(self) -> ReviewResult | None:
-        return self._result
 
     def restore_dropped(self, finding: ReviewComment) -> None:
         """Bring a verifier-rejected finding back into the review."""

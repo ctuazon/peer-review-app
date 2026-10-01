@@ -7,7 +7,7 @@ from tkinter import messagebox, ttk
 
 
 from app import load_config, save_config, secrets_backend
-from app.cost import DEFAULT_REVIEW_MODEL, EFFORTS, REVIEW_MODEL_CHOICES
+from app.cost import DEFAULT_REVIEW_MODEL, EFFORTS, REVIEW_MODEL_CHOICES, model_info
 from app.auth_status_store import clear_auth_status, load_auth_status, save_auth_status
 from ui.widgets import StatusLight, tip
 
@@ -17,6 +17,23 @@ def _number(text: str, default: float) -> float:
         return max(0.0, float(text))
     except (TypeError, ValueError):
         return default
+
+
+def _size_tiers_text(tiers: object) -> str:
+    """'Up to 300 lines: Sonnet 5.5, low · ... · larger: Opus 5.5, medium.'"""
+    if not isinstance(tiers, list):
+        return ""
+    parts = []
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        info = model_info(str(tier.get("model") or ""))
+        label = info.label.split(" (")[0] if info else str(tier.get("model"))
+        limit = tier.get("max_lines")
+        reach = f"up to {limit:,} lines" if isinstance(limit, int) else "larger"
+        parts.append(f"{reach}: {label}, {tier.get('effort')}")
+    text = " · ".join(parts)
+    return (text[0].upper() + text[1:] + ".") if text else ""
 
 
 class SettingsDialog(tk.Toplevel):
@@ -182,6 +199,18 @@ class SettingsDialog(tk.Toplevel):
             "0 disables the cost warning.",
             foreground="#666", wraplength=640, justify=tk.LEFT,
         ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        self.by_size_var = tk.BooleanVar(value=bool(self.config_data.get("review_by_size")))
+        ttk.Checkbutton(
+            review, text="Pick the model and effort by PR size", variable=self.by_size_var
+        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        ttk.Label(
+            review,
+            text=_size_tiers_text(self.config_data.get("review_size_tiers"))
+            + " Counts the changed lines Claude is sent; a re-review counts only what changed since the "
+            "last pass. Edit review_size_tiers in data/config.json to change the tiers. When this is on, "
+            "it replaces the default review model and effort for peer reviews.",
+            foreground="#666", wraplength=640, justify=tk.LEFT,
+        ).grid(row=4, column=0, columnspan=5, sticky="w")
 
         from app.jira import resolve_jira_settings
 
@@ -375,6 +404,9 @@ class SettingsDialog(tk.Toplevel):
                 "review_effort": self.effort_default_var.get() or "medium",
                 "review_mode": self.mode_default_var.get() or "agentic",
                 "verify_findings": bool(self.verify_default_var.get()),
+                "review_by_size": bool(self.by_size_var.get()),
+                # Not editable here; keep whatever data/config.json holds.
+                "review_size_tiers": self.config_data.get("review_size_tiers"),
                 "claude_timeout_minutes": _number(self.timeout_var.get(), 15),
                 "warn_review_usd": _number(self.warn_usd_var.get(), 0),
                 "bot_cheap_model": self.cheap_model_var.get().strip(),
@@ -411,5 +443,3 @@ class SettingsDialog(tk.Toplevel):
             self.after(0, lambda: self.jira_status_var.set(text))
 
         threading.Thread(target=worker, daemon=True).start()
-
-

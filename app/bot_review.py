@@ -309,135 +309,6 @@ _TRIAGE_FIELD_RE = re.compile(
 )
 
 
-def build_triage_prompt(
-    *,
-    diff: PullRequestDiff,
-    comment: BotComment,
-    file_content: str | None,
-    changed_paths: list[str],
-) -> str:
-    is_bot = is_bot_login(comment.author)
-    reviewer_desc = comment.source if is_bot else f"{comment.source}, a human reviewer"
-
-    if comment.path:
-        location = f"{comment.path}:{comment.line} ({comment.side})"
-    elif comment.kind == "review":
-        state_note = f", review state: {comment.review_state}" if comment.review_state else ""
-        location = f"(top-level PR review by {comment.author}{state_note}, no single line anchor)"
-    else:
-        location = "(top-level PR summary comment, no single line anchor)"
-    file_block = ""
-    if file_content is not None:
-        excerpt, windowed = _triage_file_excerpt(file_content, comment.line)
-        if windowed:
-            file_block = (
-                f"\nExcerpt of {comment.path} around the comment location on branch "
-                f"{diff.head_branch} (line numbers shown; only part of the file, not "
-                "the whole thing -- the full file is used automatically if a fix is "
-                f"drafted):\n```\n{excerpt}\n```\n"
-            )
-        else:
-            file_block = (
-                f"\nCurrent full content of {comment.path} on branch {diff.head_branch}:\n"
-                f"```\n{excerpt}\n```\n"
-            )
-    can_fix = comment.path is not None and file_content is not None
-
-    if can_fix:
-        reply_guidance = (
-            "If VALID is no and ADDRESSED is yes, thank the reviewer briefly and note "
-            "plainly that the current code already handles this -- be specific about "
-            "what covers it if that's evident from the file/diff shown below. If VALID "
-            "is no and ADDRESSED is no, explain plainly and respectfully why the "
-            "comment doesn't apply or is a false positive -- never dismissive, "
-            "especially toward a human reviewer. If VALID is yes, write a short note "
-            "confirming the issue -- a fix will be drafted separately."
-        )
-        context_instructions = """
-6. Decide whether the file shown above is enough to write a correct, safe
-fix. If you'd want to see one or more OTHER files first (e.g. a companion
-test file, a caller, a type/interface definition), list up to 3 relative
-repo paths, comma-separated:
-NEEDS_CONTEXT: path/one.ts, path/two.spec.ts
-Otherwise write:
-NEEDS_CONTEXT: none
-Do not guess at unrelated files just to pad this list. You are only deciding
-what you need to see -- do not write the fix itself yet.
-Always also write:
-TARGET_FILES: none
-""".strip()
-    else:
-        reply_guidance = (
-            "If VALID is no and ADDRESSED is yes, thank the reviewer briefly and note "
-            "plainly that the current code already handles this -- be specific about "
-            "what covers it if that's evident from the diff shown below. If VALID is "
-            "no and ADDRESSED is no, explain plainly and respectfully why the comment "
-            "doesn't apply or is a false positive -- never dismissive, especially "
-            "toward a human reviewer. If VALID is yes, write a short note confirming "
-            "the issue, but make clear whether an automatic fix is possible per rule 6 "
-            "below -- do not promise a fix that won't be attempted."
-        )
-        changed_list = "\n".join(f"- {p}" for p in changed_paths) or "(none)"
-        context_instructions = f"""
-6. This comment has no single line anchor (or its file couldn't be read), so:
-NEEDS_CONTEXT: none
-If -- and only if -- this comment clearly and unambiguously refers to specific
-file(s) among this PR's changed files listed below (e.g. it names exact paths,
-line ranges, or a class/function that only appears in one of them), list them
-exactly as shown, comma-separated (one file is fine, several is fine if the
-comment genuinely calls out several -- e.g. it gives separate instructions
-per file with explicit paths/line ranges):
-TARGET_FILES: path/one.php, path/two.php
-Otherwise (truly ambiguous, or names nothing file-specific):
-TARGET_FILES: none
-Do not guess -- "none" is better than a wrong file. A path quoted verbatim in
-the comment body (e.g. in backticks) is a strong signal; a vague description
-is not.
-
-Changed files in this PR:
-{changed_list}
-""".strip()
-
-    return f"""You are triaging a code-review comment left on this pull
-request by {reviewer_desc}. Decide whether the comment is a valid,
-actionable issue.
-
-Output rules (strict):
-1. Output MUST start with exactly these two lines:
-VALID: yes|no
-REASON: <one short paragraph explaining your judgment>
-2. If VALID is no, also write:
-ADDRESSED: yes|no
-(yes only if the current code shown below already resolves the concern --
-e.g. a later commit fixed it since this comment was posted. no if the
-comment is a misunderstanding, a false positive, or otherwise doesn't
-apply. If VALID is yes, skip this line entirely.)
-3. Then a REPLY section:
-REPLY:
-<the exact text to post back on the PR thread. {reply_guidance}>
-4. Do not invent files, lines, or behavior not shown in the context below.
-5. Write REPLY in plain engineering English: no "It's worth noting", "Notably",
-"Furthermore", "leverage", "delve", or other AI-sounding filler. Short, direct
-sentences.
-{context_instructions}
-
-Pull request: {diff.ref.url}
-Title: {diff.title}
-
-Reviewer: {comment.source} ({comment.author})
-Location: {location}
-Diff hunk around the comment:
-```
-{comment.diff_hunk or "(none, top-level comment)"}
-```
-Comment body:
-{comment.body}
-{file_block}
-Broader PR diff for context:
-{summarize_diff_for_prompt(diff, max_chars=60_000)}
-"""
-
-
 def _split_path_list(raw: str) -> list[str]:
     raw = (raw or "").strip()
     if not raw or raw.lower() == "none":
@@ -504,9 +375,8 @@ def _triage_comment_block(
     file_content: str | None,
     changed_paths: list[str],
 ) -> str:
-    """One comment's self-contained context for a batched triage prompt --
-    everything build_triage_prompt would show for it, minus the shared
-    preamble/PR diff, which the batch prompt only includes once."""
+    """One comment's self-contained context for a batched triage prompt,
+    minus the shared preamble/PR diff, which the batch prompt only includes once."""
     is_bot = is_bot_login(comment.author)
     who = "bot" if is_bot else "human reviewer"
 

@@ -314,16 +314,6 @@ def check_claude_auth() -> tuple[bool, str]:
     return False, "not signed in"
 
 
-def github_auth_status() -> str:
-    ok, detail = check_github_auth()
-    return f"GitHub: {'signed in — ' if ok else ''}{detail}" if ok else f"GitHub: {detail}"
-
-
-def claude_auth_status() -> str:
-    ok, detail = check_claude_auth()
-    return f"Claude: {'signed in as ' if ok else ''}{detail}" if ok else f"Claude: {detail}"
-
-
 def win_path_to_wsl(path: Path) -> str:
     resolved = path.resolve()
     drive = resolved.drive.rstrip(":").lower()
