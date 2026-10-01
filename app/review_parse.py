@@ -7,14 +7,40 @@ from typing import Any
 
 from app.github_pr import PullRequestDiff, create_review_comment, post_issue_comment
 
+# "praise" only ever comes from the legacy text format; the JSON schema has no
+# such severity, because a clean PR gets an approval and no findings.
+LEGACY_SEVERITIES = ("blocker", "major", "minor", "nit", "praise")
+
 
 @dataclass
 class ReviewComment:
+    """One finding. `comment` is the body; the rest is filled by the JSON path
+    (title, suggestion, …) or set later by validation and posting."""
+
     file_path: str
     line: int | None
     side: str
     severity: str
     comment: str
+    title: str = ""
+    start_line: int | None = None
+    symbol: str = ""
+    anchor: str = ""
+    suggestion: str | None = None
+    confidence: str = "medium"
+    also_flagged_by: str | None = None
+    also_flagged_url: str | None = None
+    fp: str = ""
+    # Why this finding can't be posted inline as-is ("line not in diff",
+    # "unknown severity 'x'"); empty when it's fine.
+    problem: str = ""
+    include: bool = True
+    posted_url: str = ""
+    verifier_note: str = ""
+
+    @property
+    def location(self) -> str:
+        return self.file_path if self.line is None else f"{self.file_path}:{self.line}"
 
     @property
     def copy_block(self) -> str:
@@ -49,6 +75,7 @@ def _parse_block(file_rest: str, body: str) -> ReviewComment | None:
     line: int | None = None
     side = ""
     severity = ""
+    problems: list[str] = []
 
     loc = _INLINE_LOC_RE.match(path)
     if loc:
@@ -68,6 +95,8 @@ def _parse_block(file_rest: str, body: str) -> ReviewComment | None:
             key, value = field.group("key").upper(), field.group("value")
             if key == "LINE":
                 line = int(value) if value.isdigit() else None
+                if line is None and value and value != "?":
+                    problems.append(f"LINE '{value}' is not a number")
             elif key == "SIDE" and value.upper() in ("RIGHT", "LEFT"):
                 side = value
             elif key == "SEVERITY" and value:
@@ -90,12 +119,19 @@ def _parse_block(file_rest: str, body: str) -> ReviewComment | None:
     while comment_lines and (not comment_lines[-1].strip() or _SEPARATOR_RE.match(comment_lines[-1])):
         comment_lines.pop()
 
+    severity = severity.lower()
+    if severity not in LEGACY_SEVERITIES:
+        # Don't quietly downgrade an unknown severity to nit; keep it visible
+        # but out of the submit set until someone picks a real one.
+        problems.append(f"unknown severity '{severity}'" if severity else "no SEVERITY given")
     return ReviewComment(
         file_path=path.removeprefix("./"),
         line=line,
         side=(side or "RIGHT").upper(),
-        severity=(severity or "nit").lower(),
+        severity=severity if severity in LEGACY_SEVERITIES else "nit",
         comment="\n".join(comment_lines).strip(),
+        problem="; ".join(problems),
+        include=not problems,
     )
 
 

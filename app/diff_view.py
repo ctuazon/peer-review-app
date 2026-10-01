@@ -13,6 +13,15 @@ from app.review_parse import (
     comments_to_copy_text,
     parse_review_comments,
 )
+from app.review_schema import ReviewResult, parse_review_output
+from ui.widgets import Tooltip, tip
+
+VERDICT_STYLES = {
+    "approve": ("#dafbe1", "#1a7f37"),
+    "approve_with_nits": ("#ddf4ff", "#0550ae"),
+    "changes_requested": ("#ffebe9", "#cf222e"),
+}
+STATUS_ICONS = {"fixed": "✅", "open": "⏳", "withdrawn": "↩", "changed": "✏"}
 
 
 SEVERITY_COLORS = {
@@ -241,6 +250,8 @@ class DiffReviewView(ttk.Frame):
         self._copy_text = ""
         self._comments: list[ReviewComment] = []
         self._diff: PullRequestDiff | None = None
+        self._result: ReviewResult | None = None
+        self._summary_lines: list[str] = []
         self._panels: list[CollapsiblePanel] = []
         self._text_widgets: list[tk.Text] = []
         self._pages: list[CollapsiblePanel] = []
@@ -264,14 +275,22 @@ class DiffReviewView(ttk.Frame):
             self._action_bar, text="Submit to GitHub…", command=self._handle_submit_click
         )
         self.submit_btn.pack(side=tk.RIGHT)
+        Tooltip(
+            self.submit_btn,
+            "Review the findings, pick which to include, and post them to the PR as one GitHub review.",
+        )
         self._submit_visible = False
 
         self._toolbar = toolbar = ttk.Frame(self)
         toolbar.pack(fill=tk.X, pady=(0, 4))
-        ttk.Button(toolbar, text="Expand all", command=self.expand_all).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Collapse all", command=self.collapse_all).pack(
-            side=tk.LEFT, padx=4
-        )
+        tip(
+            ttk.Button(toolbar, text="Expand all", command=self.expand_all),
+            "Open every file's diff.",
+        ).pack(side=tk.LEFT)
+        tip(
+            ttk.Button(toolbar, text="Collapse all", command=self.collapse_all),
+            "Fold every file's diff down to its header.",
+        ).pack(side=tk.LEFT, padx=4)
         self.summary_var = tk.StringVar(value="")
         ttk.Label(toolbar, textvariable=self.summary_var).pack(side=tk.LEFT, padx=10)
 
@@ -285,8 +304,10 @@ class DiffReviewView(ttk.Frame):
         pager_buttons.pack(fill=tk.X)
         self.prev_btn = ttk.Button(pager_buttons, text="◀ Prev", command=self.prev_page)
         self.prev_btn.pack(side=tk.LEFT)
+        Tooltip(self.prev_btn, "Previous file in this PR.")
         self.next_btn = ttk.Button(pager_buttons, text="Next ▶", command=self.next_page)
         self.next_btn.pack(side=tk.LEFT, padx=(4, 0))
+        Tooltip(self.next_btn, "Next file in this PR.")
         self.page_label_var = tk.StringVar(value="")
         ttk.Label(self.pager, textvariable=self.page_label_var).pack(
             anchor="w", pady=(2, 0)
@@ -299,6 +320,7 @@ class DiffReviewView(ttk.Frame):
             self.jump_bar, text="Next comment ▼", command=self.jump_to_next_comment
         )
         self.jump_btn.pack(side=tk.LEFT)
+        Tooltip(self.jump_btn, "Scroll to the next review comment, moving to the next file when needed.")
         self.jump_label_var = tk.StringVar(value="")
         self.jump_label = ttk.Label(self.jump_bar, textvariable=self.jump_label_var)
         self.jump_label.pack(side=tk.LEFT, padx=(8, 0))
@@ -356,6 +378,7 @@ class DiffReviewView(ttk.Frame):
         self._copy_text = ""
         self._comments = []
         self._diff = None
+        self._result = None
         self._panels.clear()
         self._text_widgets.clear()
         self._pages.clear()
@@ -537,27 +560,76 @@ class DiffReviewView(ttk.Frame):
         review_text: str,
         summary_lines: Iterable[str] | None = None,
     ) -> None:
+        """Legacy entry point: parse text (JSON or FILE:/LINE: blocks) and render."""
+        self.render_result(diff=diff, result=parse_review_output(review_text), summary_lines=summary_lines)
+
+    def get_result(self) -> ReviewResult | None:
+        return self._result
+
+    def restore_dropped(self, finding: ReviewComment) -> None:
+        """Bring a verifier-rejected finding back into the review."""
+        if self._result is None or self._diff is None:
+            return
+        if any(f is finding for f in self._result.dropped_by_verifier):
+            self._result.dropped_by_verifier = [f for f in self._result.dropped_by_verifier if f is not finding]
+            finding.verifier_note = (finding.verifier_note + " (restored by you)").strip()
+            self._result.findings.append(finding)
+            self.render_result(diff=self._diff, result=self._result, summary_lines=self._summary_lines)
+
+    def _banner(self, result: ReviewResult) -> None:
+        bg, fg = VERDICT_STYLES.get(result.verdict, ("#f6f8fa", "#1f2328"))
+        box = tk.Frame(self.inner, background=bg, padx=10, pady=6)
+        box.pack(fill=tk.X, padx=4, pady=(0, 6))
+        tk.Label(box, text=result.headline(), background=bg, foreground=fg,
+                 font=("Segoe UI", 11, "bold"), anchor="w").pack(fill=tk.X)
+        for label, text in (("", result.verdict_reason), ("Scope: ", result.scope_note), ("Tests: ", result.tests_note)):
+            if text:
+                tk.Label(box, text=label + text, background=bg, foreground="#1f2328", anchor="w",
+                         justify=tk.LEFT, wraplength=880).pack(fill=tk.X)
+        if result.parse_mode == "legacy":
+            tk.Label(box, text="Parsed via legacy fallback: the JSON output didn't parse.",
+                     background="#fff8c5", foreground="#9a6700", anchor="w").pack(fill=tk.X, pady=(4, 0))
+        if not result.findings:
+            tk.Label(box, text="No findings: nothing to post inline.", background=bg, foreground=fg,
+                     anchor="w").pack(fill=tk.X, pady=(4, 0))
+
+    def _text_panel(self, title: str, subtitle: str, *, expanded: bool, severity: str | None = None) -> tk.Text:
+        panel = CollapsiblePanel(
+            self.inner, title=title, subtitle=subtitle, expanded=expanded,
+            on_toggle=lambda _p: self._on_inner_configure(), has_review=True, severity=severity,
+        )
+        self._panels.append(panel)
+        self._pages.append(panel)
+        text = self._make_diff_text(panel.body)
+        self._text_widgets.append(text)
+        return text
+
+    def render_result(
+        self,
+        *,
+        diff: PullRequestDiff,
+        result: ReviewResult,
+        summary_lines: Iterable[str] | None = None,
+    ) -> None:
         self.clear()
         self._diff = diff
-        comments = parse_review_comments(review_text)
+        self._result = result
+        self._summary_lines = list(summary_lines or [])
+        comments = list(result.findings)
         self._comments = comments
-        self._copy_text = comments_to_copy_text(comments) or review_text
+        self._copy_text = comments_to_copy_text(comments) or result.raw_text
 
-        if summary_lines:
-            summary = "  ·  ".join(summary_lines)
-            self.summary_var.set(summary)
-            summary_box = ttk.Label(
-                self.inner,
-                text="\n".join(summary_lines),
-                justify=tk.LEFT,
-                wraplength=900,
+        self._banner(result)
+        if self._summary_lines:
+            self.summary_var.set("  ·  ".join(self._summary_lines[:2]))
+            ttk.Label(self.inner, text="\n".join(self._summary_lines), justify=tk.LEFT, wraplength=900).pack(
+                fill=tk.X, padx=4, pady=(0, 8)
             )
-            summary_box.pack(fill=tk.X, padx=4, pady=(0, 8))
 
         by_key: dict[tuple[str, int, str], list[ReviewComment]] = {}
         orphans: list[ReviewComment] = []
         for comment in comments:
-            if comment.line is None:
+            if comment.line is None or comment.problem:
                 orphans.append(comment)
                 continue
             key = (normalize_path(comment.file_path), comment.line, comment.side.upper())
@@ -614,29 +686,63 @@ class DiffReviewView(ttk.Frame):
             enable_selection_copy(text)
             self._fit_text_height(text)
 
-        leftover = [c for c in comments if id(c) not in used] + orphans
+        orphan_ids = {id(c) for c in orphans}
+        leftover = [c for c in comments if id(c) not in used and id(c) not in orphan_ids] + orphans + list(result.rejected)
         if leftover:
-            panel = CollapsiblePanel(
-                self.inner,
-                title="Unplaced review comments",
-                subtitle=f"{len(leftover)} comment{'s' if len(leftover) != 1 else ''}",
-                expanded=True,
-                on_toggle=lambda _p: self._on_inner_configure(),
-                has_review=True,
-                severity=_worst_severity(leftover),
+            text = self._text_panel(
+                "Unplaced review comments",
+                f"{len(leftover)} comment{'s' if len(leftover) != 1 else ''} (file-level, not in diff, or invalid)",
+                expanded=True, severity=_worst_severity(leftover),
             )
-            self._panels.append(panel)
-            self._pages.append(panel)
-            text = self._make_diff_text(panel.body)
-            self._text_widgets.append(text)
             for comment in leftover:
                 self._insert_comment(text, comment, len(self._pages) - 1)
             enable_selection_copy(text)
             self._fit_text_height(text)
 
+        if result.prior:
+            text = self._text_panel("Since last review", f"{len(result.prior)} earlier finding(s)", expanded=True)
+            for p in result.prior:
+                who = "" if p.own else f" [{p.raised_by or 'another reviewer'}]"
+                text.insert(tk.END, f" {STATUS_ICONS.get(p.status, '')} {p.status.upper()}{who}  {p.title}\n", ("comment_header",))
+                if p.note:
+                    text.insert(tk.END, f"{p.note}\n", ("comment_box",))
+                if p.thread_url:
+                    text.insert(tk.END, f"{p.thread_url}\n", ("meta",))
+            enable_selection_copy(text)
+            self._fit_text_height(text)
+
+        if result.credits or result.disagreements:
+            text = self._text_panel(
+                "Other reviewers",
+                f"{len(result.credits)} credit(s), {len(result.disagreements)} disagreement(s)",
+                expanded=True,
+            )
+            for c in result.credits:
+                text.insert(tk.END, f" CREDIT  {c.reviewer}\n", ("comment_header",))
+                text.insert(tk.END, f"{c.point}\n\n", ("comment_box",))
+            for d in result.disagreements:
+                text.insert(tk.END, f" DISAGREE  {d.reviewer}: {d.claim}\n", ("comment_header", "sev_blocker"))
+                text.insert(tk.END, f"{d.rebuttal}\n(Reply with this rebuttal from Submit to GitHub.)\n\n", ("comment_box",))
+            enable_selection_copy(text)
+            self._fit_text_height(text)
+
+        if result.dropped_by_verifier:
+            text = self._text_panel(
+                "Dropped by verifier",
+                f"{len(result.dropped_by_verifier)} finding(s); Restore keeps one",
+                expanded=False,
+            )
+            for comment in list(result.dropped_by_verifier):
+                button = ttk.Button(text, text="Restore", command=lambda c=comment: self.restore_dropped(c))
+                Tooltip(button, "Move this finding back into the review (the verifier had dropped it).")
+                text.window_create(tk.END, window=button)
+                text.insert(tk.END, "\n")
+                self._insert_comment(text, comment, len(self._pages) - 1)
+            self._fit_text_height(text)
+
         self._update_jump_ui()
         self._show_page(0)
-        self._set_submit_visible(bool(self._comments))
+        self._set_submit_visible(bool(self._comments) or bool(result.prior) or result.parse_mode == "json")
 
     def _make_diff_text(self, parent: tk.Misc) -> tk.Text:
         text = tk.Text(
@@ -789,10 +895,22 @@ class DiffReviewView(ttk.Frame):
         sev_tag = f"sev_{sev}" if sev in SEVERITY_COLORS else "comment_header"
         header = (
             f"[{sev.upper()}]  {comment.file_path}"
-            f":{comment.line if comment.line is not None else '?'}  ·  {comment.side}\n"
+            f":{comment.line if comment.line is not None else '?'}  ·  {comment.side}"
         )
-        text.insert(tk.END, header, ("comment_header", sev_tag))
+        if comment.title:
+            header += f"  ·  {comment.title}"
+        if comment.confidence == "low":
+            header += "  ·  low confidence"
+        text.insert(tk.END, header + "\n", ("comment_header", sev_tag))
+        if comment.problem:
+            text.insert(tk.END, f"⚠ {comment.problem}\n", ("comment_header", "sev_blocker"))
+        if comment.verifier_note:
+            text.insert(tk.END, f"Verifier: {comment.verifier_note}\n", ("comment_box",))
         body = comment.comment.strip() or "(empty comment)"
         for line in body.splitlines() or [body]:
             text.insert(tk.END, f"{line}\n", ("comment_box",))
+        if comment.suggestion:
+            text.insert(tk.END, "Suggested change:\n", ("comment_box",))
+            for line in comment.suggestion.splitlines():
+                text.insert(tk.END, f"    {line}\n", ("comment_box",))
         text.insert(tk.END, "\n", ("comment_box",))

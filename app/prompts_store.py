@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from app import PROMPTS_PATH, ensure_data_dir, load_json, save_json
@@ -17,6 +17,9 @@ class Prompt:
     repo_type: str
     content: str
     is_generic: bool = False
+    # [{"path": "src/Api/**", "instructions": "..."}]: asked of the model only
+    # when a changed file matches the glob.
+    path_instructions: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Prompt":
@@ -33,6 +36,11 @@ class Prompt:
             repo_type=repo_type,
             content=data.get("content") or "",
             is_generic=is_generic,
+            path_instructions=[
+                {"path": str(item["path"]), "instructions": str(item["instructions"])}
+                for item in data.get("path_instructions") or []
+                if isinstance(item, dict) and item.get("path") and item.get("instructions")
+            ],
         )
 
     def to_dict(self) -> dict[str, Any]:

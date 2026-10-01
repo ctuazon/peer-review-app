@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys
 import threading
 import tkinter as tk
-import webbrowser
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
@@ -18,22 +17,15 @@ from app import load_config, save_config
 from app.auth_status_store import clear_auth_status, load_auth_status, save_auth_status
 from app.bot_review import (
     BotFinding,
-    apply_bot_fixes_batch,
-    post_bot_reply,
     run_bot_comment_check,
 )
 from app.diff_view import DiffReviewView, enable_selection_copy
 from app.github_pr import PullRequestDiff, fetch_pull_request, parse_pr_url
 from app.history_store import (
-    HistoryEntry,
     add_history_entry,
-    clear_history,
-    delete_history_entry,
-    get_history_entry,
-    list_history,
     list_reviews_for_pr,
 )
-from app.lint_fix import LintFinding, apply_lint_fixes_batch, run_lint_check
+from app.lint_fix import LintFinding, run_lint_check
 from app.merge_conflict import (
     ConflictFile,
     ConflictSession,
@@ -42,1518 +34,50 @@ from app.merge_conflict import (
     open_conflict_session,
 )
 from app.prompts_store import (
-    GENERIC_REPO_TYPE,
-    Prompt,
     PromptCycler,
-    create_prompt,
-    delete_prompt,
-    list_prompts,
-    move_prompt,
-    move_prompt_to_index,
-    update_prompt,
 )
-from app.review import format_copy_friendly, run_peer_review, run_pr_ask, run_pr_explanation
-from app.review_parse import ReviewComment, post_review_comment
+from app.cost import EFFORTS, REVIEW_MODEL_CHOICES, budget_fit_steps
+from app.doctor import format_report, run_doctor
+from app.review import (
+    ReviewOptions,
+    ReviewPrep,
+    ReviewRun,
+    execute_review,
+    format_copy_friendly,
+    inspect_report,
+    prepare_review,
+    refine_estimate,
+    review_summary_lines,
+    review_to_history,
+    run_pr_ask,
+    run_pr_explanation,
+)
+from app.review_parse import comments_to_copy_text
 from app.wsl_auth import resolve_github_token
-
-
-class StatusLight:
-    """Small green/yellow/red indicator used for connection/auth checks."""
-
-    COLORS = {
-        "idle": ("#9ca3af", "#6b7280"),
-        "checking": ("#fbbf24", "#d97706"),
-        "ok": ("#22c55e", "#15803d"),
-        "error": ("#ef4444", "#b91c1c"),
-    }
-
-    def __init__(self, parent: tk.Misc) -> None:
-        self.canvas = tk.Canvas(parent, width=18, height=18, highlightthickness=0, bd=0)
-        self._oval = self.canvas.create_oval(
-            2, 2, 16, 16, fill="#9ca3af", outline="#6b7280", width=1
-        )
-
-    def pack(self, **kwargs) -> None:
-        self.canvas.pack(**kwargs)
-
-    def grid(self, **kwargs) -> None:
-        self.canvas.grid(**kwargs)
-
-    def set(self, state: str) -> None:
-        fill, outline = self.COLORS.get(state, self.COLORS["idle"])
-        self.canvas.itemconfigure(self._oval, fill=fill, outline=outline)
-
-
-class Tooltip:
-    """Lightweight hover tip for compact status controls."""
-
-    def __init__(self, widget: tk.Misc) -> None:
-        self.widget = widget
-        self.text = ""
-        self._tip: tk.Toplevel | None = None
-        widget.bind("<Enter>", self._show)
-        widget.bind("<Leave>", self._hide)
-
-    def set(self, text: str) -> None:
-        self.text = text or ""
-
-    def _show(self, _event: object = None) -> None:
-        if not self.text or self._tip is not None:
-            return
-        self._tip = tk.Toplevel(self.widget)
-        self._tip.wm_overrideredirect(True)
-        self._tip.attributes("-topmost", True)
-        x = self.widget.winfo_rootx() + 12
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
-        self._tip.wm_geometry(f"+{x}+{y}")
-        label = tk.Label(
-            self._tip,
-            text=self.text,
-            justify=tk.LEFT,
-            background="#1f2328",
-            foreground="#ffffff",
-            relief=tk.SOLID,
-            borderwidth=1,
-            padx=8,
-            pady=4,
-            font=("Segoe UI", 9),
-        )
-        label.pack()
-
-    def _hide(self, _event: object = None) -> None:
-        if self._tip is not None:
-            self._tip.destroy()
-            self._tip = None
-
-
-class ThinkingIndicator(ttk.Frame):
-    """Animated spinner + label shown while a review is in progress."""
-
-    def __init__(self, master: tk.Misc) -> None:
-        super().__init__(master)
-        self._running = False
-        self._angle = 0
-        self._after_id: str | None = None
-        self._phase = 0
-        self._base_message = "Thinking"
-
-        self.canvas = tk.Canvas(
-            self, width=22, height=22, highlightthickness=0, bd=0
-        )
-        self.canvas.pack(side=tk.LEFT)
-        self.label_var = tk.StringVar(value="Thinking")
-        self.label = ttk.Label(self, textvariable=self.label_var)
-        self.label.pack(side=tk.LEFT, padx=(6, 0))
-        self._draw()
-
-    def _draw(self) -> None:
-        self.canvas.delete("all")
-        self.canvas.create_oval(3, 3, 19, 19, outline="#d0d7de", width=2)
-        self.canvas.create_arc(
-            3,
-            3,
-            19,
-            19,
-            start=self._angle,
-            extent=-80,
-            style=tk.ARC,
-            outline="#0969da",
-            width=2,
-        )
-
-    def start(self, message: str = "Thinking") -> None:
-        self._base_message = message or "Thinking"
-        self.label_var.set(self._base_message)
-        self.pack(side=tk.LEFT, padx=(8, 0))
-        if self._running:
-            return
-        self._running = True
-        self._tick()
-
-    def stop(self) -> None:
-        self._running = False
-        if self._after_id is not None:
-            try:
-                self.after_cancel(self._after_id)
-            except tk.TclError:
-                pass
-            self._after_id = None
-        self.pack_forget()
-
-    def _tick(self) -> None:
-        if not self._running:
-            return
-        self._angle = (self._angle + 24) % 360
-        self._phase = (self._phase + 1) % 4
-        dots = "." * (self._phase + 1)
-        self.label_var.set(f"{self._base_message}{dots}")
-        self._draw()
-        self._after_id = self.after(90, self._tick)
-
-
-def _known_repo_types() -> list[str]:
-    """Repo-type suggestions: exact repo names seen in past PRs, plus repo
-    types already used by other prompts. Picking one of these guarantees a
-    match in prompts_for_repo() (exact repo-name match), instead of guessing
-    a token that may not appear in the actual GitHub repo slug."""
-    seen: dict[str, str] = {}
-
-    for entry in list_history():
-        if not entry.pr_url:
-            continue
-        try:
-            ref = parse_pr_url(entry.pr_url)
-        except ValueError:
-            continue
-        seen.setdefault(ref.repo.lower(), ref.repo)
-
-    for prompt in list_prompts():
-        if prompt.is_generic or prompt.repo_type.lower() == GENERIC_REPO_TYPE:
-            continue
-        seen.setdefault(prompt.repo_type.lower(), prompt.repo_type)
-
-    return sorted(seen.values(), key=str.lower)
-
-
-class PromptEditorDialog(tk.Toplevel):
-    def __init__(self, master: tk.Misc, prompt: Prompt | None = None) -> None:
-        super().__init__(master)
-        self.title("Edit Prompt" if prompt else "New Prompt")
-        self.resizable(True, True)
-        self.transient(master)
-        self.grab_set()
-        self.result: Prompt | None = None
-        self._prompt = prompt
-
-        frame = ttk.Frame(self, padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(frame, text="Name").grid(row=0, column=0, sticky="w")
-        self.name_var = tk.StringVar(value=prompt.name if prompt else "")
-        ttk.Entry(frame, textvariable=self.name_var, width=50).grid(
-            row=0, column=1, sticky="ew", pady=4
-        )
-
-        ttk.Label(frame, text="Repo type").grid(row=1, column=0, sticky="w")
-        self.repo_var = tk.StringVar(
-            value=prompt.repo_type if prompt else GENERIC_REPO_TYPE
-        )
-        repo_row = ttk.Frame(frame)
-        repo_row.grid(row=1, column=1, sticky="ew", pady=4)
-        ttk.Combobox(
-            repo_row,
-            textvariable=self.repo_var,
-            width=28,
-            values=_known_repo_types(),
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(
-            repo_row,
-            text="(pick the exact repo name from a past PR, e.g. marketplace-ssr)",
-        ).pack(side=tk.LEFT, padx=8)
-
-        self.generic_var = tk.BooleanVar(
-            value=prompt.is_generic if prompt else True
-        )
-        ttk.Checkbutton(
-            frame,
-            text="Generic reviewer (applies to all repos)",
-            variable=self.generic_var,
-            command=self._on_generic_toggle,
-        ).grid(row=2, column=1, sticky="w", pady=4)
-
-        ttk.Label(frame, text="Prompt").grid(row=3, column=0, sticky="nw")
-        self.content = scrolledtext.ScrolledText(frame, width=70, height=18, wrap=tk.WORD)
-        self.content.grid(row=3, column=1, sticky="nsew", pady=4)
-        if prompt:
-            self.content.insert("1.0", prompt.content)
-
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=4, column=1, sticky="e", pady=(8, 0))
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(buttons, text="Save", command=self._save).pack(side=tk.RIGHT)
-
-        frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(3, weight=1)
-        self._on_generic_toggle()
-        self.geometry("720x520")
-        self.wait_visibility()
-        self.focus_force()
-
-    def _on_generic_toggle(self) -> None:
-        if self.generic_var.get():
-            self.repo_var.set(GENERIC_REPO_TYPE)
-        elif self.repo_var.get().strip().lower() == GENERIC_REPO_TYPE:
-            self.repo_var.set("")
-
-    def _save(self) -> None:
-        name = self.name_var.get().strip()
-        content = self.content.get("1.0", "end-1c")
-        is_generic = bool(self.generic_var.get())
-        repo_type = GENERIC_REPO_TYPE if is_generic else self.repo_var.get().strip()
-        if not name:
-            messagebox.showerror("Missing name", "Please enter a prompt name.", parent=self)
-            return
-        if not repo_type:
-            messagebox.showerror(
-                "Missing repo type",
-                "Please enter a repo type, or mark the prompt as generic.",
-                parent=self,
-            )
-            return
-        try:
-            if self._prompt:
-                self.result = update_prompt(
-                    self._prompt.id,
-                    name=name,
-                    repo_type=repo_type,
-                    content=content,
-                    is_generic=is_generic,
-                )
-            else:
-                self.result = create_prompt(
-                    name=name,
-                    repo_type=repo_type,
-                    content=content,
-                    is_generic=is_generic,
-                )
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Save failed", str(exc), parent=self)
-            return
-        self.destroy()
-
-
-class BotReviewDialog(tk.Toplevel):
-    """Shows CodeRabbit / Amazon Q findings plus human reviewer feedback.
-    Fixable findings get a checkbox to queue them; queued fixes are pushed as
-    a single commit via Apply all."""
-
-    def __init__(
-        self,
-        master: tk.Misc,
-        *,
-        diff: PullRequestDiff,
-        findings: list[BotFinding],
-        token: str,
-        config: dict,
-    ) -> None:
-        super().__init__(master)
-        self.diff = diff
-        self.token = token
-        self.config = config
-        self._findings = list(findings)
-        self._queue_vars: dict[int, tk.BooleanVar] = {}
-        self._reply_widgets: dict[int, tk.Text] = {}
-        self._card_state: dict[int, dict] = {}
-        self.title(f"Review comments — {diff.ref.full_name}#{diff.ref.number}")
-        self.resizable(True, True)
-        self.transient(master)
-        self.geometry("880x680")
-
-        header = ttk.Frame(self, padding=(12, 12, 12, 4))
-        header.pack(fill=tk.X)
-        valid_count = sum(1 for f in findings if f.verdict.valid)
-        addressed_count = sum(1 for f in findings if not f.verdict.valid and f.verdict.addressed)
-        not_applicable_count = len(findings) - valid_count - addressed_count
-        fixable_count = sum(1 for f in findings if f.verdict.valid and f.verdict.fixes)
-        ttk.Label(
-            header,
-            text=(
-                f"{diff.title}\n"
-                f"{len(findings)} comment(s) found (bots + reviewers) — {valid_count} judged valid, "
-                f"{addressed_count} already addressed, {not_applicable_count} not applicable, "
-                f"{fixable_count} with a proposed fix.\n"
-                "Check the fixes you want, then Apply all pushes them as one commit."
-            ),
-            justify=tk.LEFT,
-        ).pack(anchor="w")
-
-        canvas = tk.Canvas(self, highlightthickness=0)
-        vscroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=vscroll.set)
-        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0), pady=(4, 12))
-
-        inner = ttk.Frame(canvas)
-        window = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind(
-            "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
-        canvas.bind(
-            "<Enter>",
-            lambda _e: canvas.bind_all(
-                "<MouseWheel>",
-                lambda ev: canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units"),
-            ),
-        )
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
-
-        for finding in findings:
-            self._build_card(inner, finding)
-
-        if fixable_count:
-            bottom_bar = ttk.Frame(self, padding=(12, 0, 12, 4))
-            bottom_bar.pack(fill=tk.X)
-            self.apply_all_status_var = tk.StringVar(value="")
-            ttk.Label(bottom_bar, textvariable=self.apply_all_status_var).pack(side=tk.LEFT)
-            self.apply_all_btn = ttk.Button(
-                bottom_bar, text="Apply all", state=tk.DISABLED, command=self._apply_all
-            )
-            self.apply_all_btn.pack(side=tk.RIGHT)
-
-        ttk.Button(self, text="Close", command=self.destroy).pack(pady=(0, 10))
-
-    def _make_scroll_text(
-        self, parent: tk.Misc, *, height: int, wrap: str = tk.WORD, font=None
-    ) -> tuple[ttk.Frame, tk.Text]:
-        """A Text widget with an attached vertical scrollbar, for content that
-        may run longer than the visible height."""
-        frame = ttk.Frame(parent)
-        kwargs: dict = {"height": height, "wrap": wrap}
-        if font:
-            kwargs["font"] = font
-        text = tk.Text(frame, **kwargs)
-        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
-        text.configure(yscrollcommand=scroll.set)
-        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        return frame, text
-
-    def _build_card(self, parent: tk.Misc, finding: BotFinding) -> None:
-        comment = finding.comment
-        verdict = finding.verdict
-        if comment.path:
-            location = f"{comment.path}:{comment.line}"
-        elif comment.kind == "review":
-            location = f"PR review ({comment.review_state})" if comment.review_state else "PR review"
-        else:
-            location = "PR summary comment"
-
-        card = ttk.LabelFrame(parent, text=f"[{comment.source}] {location}", padding=10)
-        card.pack(fill=tk.X, expand=True, padx=4, pady=6)
-
-        if verdict.valid:
-            verdict_color, verdict_text = "#1a7f37", "VALID"
-        elif verdict.addressed:
-            verdict_color, verdict_text = "#57606a", "ALREADY ADDRESSED"
-        else:
-            verdict_color, verdict_text = "#cf222e", "NOT VALID"
-        tk.Label(
-            card, text=verdict_text, fg=verdict_color, font=("Segoe UI", 9, "bold")
-        ).pack(anchor="w")
-
-        ttk.Label(card, text=verdict.reason or "(no reason given)", wraplength=760, justify=tk.LEFT).pack(
-            anchor="w", pady=(2, 6)
-        )
-
-        if verdict.valid and not verdict.fixes and verdict.fix_unavailable_reason:
-            ttk.Label(
-                card,
-                text=verdict.fix_unavailable_reason,
-                foreground="#9a6700",
-                wraplength=760,
-                justify=tk.LEFT,
-            ).pack(anchor="w", pady=(0, 6))
-
-        original = ttk.LabelFrame(card, text="Original comment", padding=6)
-        original.pack(fill=tk.X, pady=(0, 6))
-        body = comment.body.strip() or "(empty)"
-        original_frame, original_text = self._make_scroll_text(
-            original, height=min(10, max(2, body.count("\n") + 2))
-        )
-        original_text.insert("1.0", body)
-        original_text.configure(state=tk.DISABLED)
-        original_frame.pack(fill=tk.BOTH, expand=True)
-
-        has_fix = verdict.valid and bool(verdict.fixes)
-        if has_fix:
-            for fix in verdict.fixes:
-                fix_box = ttk.LabelFrame(card, text=f"Proposed fix — {fix.path}", padding=6)
-                fix_box.pack(fill=tk.X, pady=(0, 6))
-                diff_text = fix.diff_text or "(no textual difference detected)"
-                lines = diff_text.splitlines()
-                shown_lines = lines[:60]
-                shown = "\n".join(shown_lines)
-                if len(lines) > 60:
-                    shown += f"\n… ({len(lines) - 60} more lines)"
-                fix_text = tk.Text(
-                    fix_box,
-                    height=min(20, max(4, len(shown_lines) + 1)),
-                    wrap=tk.NONE,
-                    font=("Consolas", 9),
-                )
-                fix_text.insert("1.0", shown)
-                fix_text.configure(state=tk.DISABLED)
-                fix_text.pack(fill=tk.X)
-
-        reply_box = ttk.LabelFrame(card, text="Reply to post (edit before sending)", padding=6)
-        reply_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
-        reply_body = verdict.reply_text or ""
-        reply_frame, reply_widget = self._make_scroll_text(
-            reply_box, height=min(8, max(3, reply_body.count("\n") + 2))
-        )
-        reply_widget.insert("1.0", reply_body)
-        reply_frame.pack(fill=tk.BOTH, expand=True)
-
-        status_var = tk.StringVar(value="")
-        action_row = ttk.Frame(card)
-        action_row.pack(fill=tk.X, pady=(4, 0))
-
-        if has_fix:
-            file_note = "1 file" if len(verdict.fixes) == 1 else f"{len(verdict.fixes)} files"
-            queue_var = tk.BooleanVar(value=False)
-            check = ttk.Checkbutton(
-                action_row,
-                text=f"Queue this fix ({file_note}) for Apply all",
-                variable=queue_var,
-                command=self._update_apply_all_state,
-            )
-            check.pack(side=tk.LEFT)
-            self._queue_vars[id(finding)] = queue_var
-            self._reply_widgets[id(finding)] = reply_widget
-            self._card_state[id(finding)] = {"check": check, "status_var": status_var}
-        else:
-            reply_btn = ttk.Button(action_row, text="Post reply")
-            reply_btn.configure(
-                command=lambda f=finding, b=reply_btn, s=status_var, w=reply_widget: self._post_reply(
-                    f, b, s, w
-                )
-            )
-            reply_btn.pack(side=tk.LEFT)
-
-        ttk.Label(action_row, textvariable=status_var).pack(side=tk.LEFT, padx=(10, 0))
-
-        if comment.html_url:
-            link = ttk.Label(card, text="Open on GitHub", foreground="#0969da", cursor="hand2")
-            link.pack(anchor="w", pady=(4, 0))
-            link.bind("<Button-1>", lambda _e, u=comment.html_url: webbrowser.open(u))
-
-    def _update_apply_all_state(self) -> None:
-        n = sum(1 for var in self._queue_vars.values() if var.get())
-        if n == 0:
-            self.apply_all_btn.configure(state=tk.DISABLED, text="Apply all")
-        else:
-            self.apply_all_btn.configure(state=tk.NORMAL, text=f"Apply all ({n}) as one commit")
-
-    def _apply_all(self) -> None:
-        selected = [
-            f
-            for f in self._findings
-            if id(f) in self._queue_vars and self._queue_vars[id(f)].get()
-        ]
-        if not selected:
-            return
-
-        for finding in selected:
-            reply_widget = self._reply_widgets[id(finding)]
-            reply_text = reply_widget.get("1.0", "end-1c").strip()
-            if not reply_text:
-                messagebox.showerror(
-                    "Missing reply",
-                    f"The reply text for the {finding.comment.source} comment on "
-                    f"{finding.comment.path or 'the PR'} can't be empty.",
-                    parent=self,
-                )
-                return
-            finding.verdict.reply_text = reply_text
-
-        file_count = sum(len(f.verdict.fixes) for f in selected)
-        if not messagebox.askyesno(
-            "Apply all",
-            f"Apply {len(selected)} fix(es) across {file_count} file(s) as one commit to "
-            f"{self.diff.head_branch}, then post {len(selected)} reply(ies)?\n\n"
-            "This pushes directly to the PR branch and can't be undone from here.",
-            parent=self,
-        ):
-            return
-
-        self.apply_all_btn.configure(state=tk.DISABLED)
-        self.apply_all_status_var.set("Applying…")
-        for finding in selected:
-            state = self._card_state[id(finding)]
-            state["check"].configure(state=tk.DISABLED)
-            state["status_var"].set("Queued…")
-
-        def on_merge_event(event: dict) -> None:
-            text = str(event.get("text") or "")
-            if text:
-                self.after(0, lambda t=text: self.apply_all_status_var.set(t))
-
-        def worker() -> None:
-            try:
-                apply_bot_fixes_batch(
-                    self.diff, selected, self.token, self.config, on_event=on_merge_event
-                )
-                self.after(0, lambda: self._batch_commit_succeeded(selected))
-            except Exception as exc:  # noqa: BLE001
-                err = str(exc)
-                self.after(0, lambda e=err: self._batch_failed(selected, e))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _batch_commit_succeeded(self, findings: list[BotFinding]) -> None:
-        self.apply_all_status_var.set("Committed — posting replies…")
-        for finding in findings:
-            self._card_state[id(finding)]["status_var"].set("Committed — posting reply…")
-
-        def worker() -> None:
-            results: list[tuple[BotFinding, str | None]] = []
-            for finding in findings:
-                try:
-                    post_bot_reply(self.diff, finding, self.token)
-                    results.append((finding, None))
-                except Exception as exc:  # noqa: BLE001
-                    results.append((finding, str(exc)))
-            self.after(0, lambda: self._batch_replies_done(results))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _batch_replies_done(self, results: list[tuple[BotFinding, str | None]]) -> None:
-        failures = []
-        for finding, error in results:
-            state = self._card_state[id(finding)]
-            reply_widget = self._reply_widgets[id(finding)]
-            if error:
-                state["status_var"].set("Committed, reply failed")
-                failures.append(f"{finding.comment.source} ({finding.comment.path or 'PR'}): {error}")
-            else:
-                state["status_var"].set("Applied + replied ✓")
-                reply_widget.configure(state=tk.DISABLED)
-        self.apply_all_status_var.set("Done" if not failures else "Done, with reply failures")
-        if failures:
-            messagebox.showerror(
-                "Some replies failed to post",
-                "Code changes were committed, but these replies failed:\n\n" + "\n".join(failures),
-                parent=self,
-            )
-
-    def _batch_failed(self, findings: list[BotFinding], error: str) -> None:
-        for finding in findings:
-            state = self._card_state[id(finding)]
-            state["check"].configure(state=tk.NORMAL)
-            state["status_var"].set("")
-        self.apply_all_status_var.set("")
-        self._update_apply_all_state()
-        messagebox.showerror("Apply all failed", error, parent=self)
-
-    def _post_reply(
-        self,
-        finding: BotFinding,
-        button: ttk.Button,
-        status_var: tk.StringVar,
-        reply_widget: tk.Text,
-    ) -> None:
-        reply_text = reply_widget.get("1.0", "end-1c").strip()
-        if not reply_text:
-            messagebox.showerror("Missing reply", "The reply text can't be empty.", parent=self)
-            return
-        finding.verdict.reply_text = reply_text
-        button.configure(state=tk.DISABLED)
-        status_var.set("Posting…")
-
-        def worker() -> None:
-            try:
-                post_bot_reply(self.diff, finding, self.token)
-                self.after(
-                    0,
-                    lambda: self._card_action_succeeded(reply_widget, status_var, "Reply posted ✓"),
-                )
-            except Exception as exc:  # noqa: BLE001
-                err = str(exc)
-                self.after(0, lambda e=err: self._card_action_failed(button, status_var, e))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _card_action_succeeded(
-        self, reply_widget: tk.Text, status_var: tk.StringVar, message: str
-    ) -> None:
-        status_var.set(message)
-        reply_widget.configure(state=tk.DISABLED)
-
-    def _card_action_failed(self, button: ttk.Button, status_var: tk.StringVar, error: str) -> None:
-        button.configure(state=tk.NORMAL)
-        status_var.set("Failed")
-        messagebox.showerror("Action failed", error, parent=self)
-
-
-class MergeConflictDialog(tk.Toplevel):
-    """Review Claude's proposed resolution for each conflicting file (content
-    conflicts) and choose keep-vs-delete for structural ones, then push a
-    real two-parent merge commit once approved. Every non-conflicting file
-    in the merge was already resolved by git's own merge engine before this
-    dialog opens -- only what git itself flagged as conflicting is shown."""
-
-    def __init__(
-        self,
-        master: tk.Misc,
-        *,
-        diff: PullRequestDiff,
-        info: MergeabilityInfo,
-        session: ConflictSession,
-        conflicts: list[ConflictFile],
-        token: str,
-        config: dict,
-    ) -> None:
-        super().__init__(master)
-        self.diff = diff
-        self.info = info
-        self.session = session
-        self.token = token
-        self.config = config
-        self._conflicts = list(conflicts)
-        self._resolution_widgets: dict[int, tk.Text] = {}
-        self._delete_choice_vars: dict[int, tk.StringVar] = {}
-        self.title(f"Merge conflicts — {diff.ref.full_name}#{diff.ref.number}")
-        self.resizable(True, True)
-        self.transient(master)
-        self.geometry("900x700")
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        header = ttk.Frame(self, padding=(12, 12, 12, 4))
-        header.pack(fill=tk.X)
-        ttk.Label(
-            header,
-            text=(
-                f"{diff.title}\n"
-                f"Merging {info.base_branch} into {info.head_branch} — "
-                f"{len(conflicts)} conflicting file(s).\n"
-                "Review each resolution below (edit freely), then Push merge commit."
-            ),
-            justify=tk.LEFT,
-        ).pack(anchor="w")
-
-        canvas = tk.Canvas(self, highlightthickness=0)
-        vscroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=vscroll.set)
-        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0), pady=(4, 12))
-
-        inner = ttk.Frame(canvas)
-        window = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
-        canvas.bind(
-            "<Enter>",
-            lambda _e: canvas.bind_all(
-                "<MouseWheel>",
-                lambda ev: canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units"),
-            ),
-        )
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
-
-        for conflict in self._conflicts:
-            self._build_card(inner, conflict)
-
-        bottom_bar = ttk.Frame(self, padding=(12, 0, 12, 4))
-        bottom_bar.pack(fill=tk.X)
-        self.push_status_var = tk.StringVar(value="")
-        ttk.Label(bottom_bar, textvariable=self.push_status_var).pack(side=tk.LEFT)
-        self.push_btn = ttk.Button(
-            bottom_bar, text="Push merge commit", command=self._push
-        )
-        self.push_btn.pack(side=tk.RIGHT)
-
-        ttk.Button(self, text="Close", command=self._on_close).pack(pady=(0, 10))
-
-    def _make_scroll_text(
-        self, parent: tk.Misc, *, height: int, wrap: str = tk.WORD, font=None
-    ) -> tuple[ttk.Frame, tk.Text]:
-        frame = ttk.Frame(parent)
-        kwargs: dict = {"height": height, "wrap": wrap}
-        if font:
-            kwargs["font"] = font
-        text = tk.Text(frame, **kwargs)
-        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
-        text.configure(yscrollcommand=scroll.set)
-        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        return frame, text
-
-    def _build_card(self, parent: tk.Misc, conflict: ConflictFile) -> None:
-        card = ttk.LabelFrame(parent, text=conflict.path, padding=10)
-        card.pack(fill=tk.X, expand=True, padx=4, pady=6)
-
-        if conflict.kind == "delete_conflict":
-            deleted_where = self.info.head_branch if conflict.deleted_side == "ours" else self.info.base_branch
-            modified_where = self.info.base_branch if conflict.deleted_side == "ours" else self.info.head_branch
-            kept_content = conflict.theirs_content if conflict.deleted_side == "ours" else conflict.ours_content
-            ttk.Label(
-                card,
-                text=f"Deleted on {deleted_where}, modified on {modified_where}.",
-                foreground="#9a6700",
-                wraplength=820,
-                justify=tk.LEFT,
-            ).pack(anchor="w", pady=(0, 6))
-
-            choice_var = tk.StringVar(value="keep")
-            self._delete_choice_vars[id(conflict)] = choice_var
-
-            content_box = ttk.LabelFrame(card, text=f"Content on {modified_where}", padding=6)
-            content_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
-            body = kept_content or "(empty)"
-            content_frame, content_text = self._make_scroll_text(
-                content_box, height=min(16, max(3, body.count("\n") + 2)), font=("Consolas", 9)
-            )
-            content_text.insert("1.0", body)
-            content_frame.pack(fill=tk.BOTH, expand=True)
-            self._resolution_widgets[id(conflict)] = content_text
-
-            def on_choice_change(text=content_text) -> None:
-                text.configure(state=tk.NORMAL if choice_var.get() == "keep" else tk.DISABLED)
-
-            ttk.Radiobutton(
-                card,
-                text="Keep the modified version (nothing intentional gets lost)",
-                variable=choice_var,
-                value="keep",
-                command=on_choice_change,
-            ).pack(anchor="w")
-            ttk.Radiobutton(
-                card,
-                text="Honor the deletion (remove this file)",
-                variable=choice_var,
-                value="delete",
-                command=on_choice_change,
-            ).pack(anchor="w")
-            return
-
-        # kind == "content"
-        if not conflict.resolved:
-            ttk.Label(
-                card,
-                text=f"Could not auto-resolve: {conflict.unresolved_reason or 'unknown reason'}",
-                foreground="#cf222e",
-                wraplength=820,
-                justify=tk.LEFT,
-            ).pack(anchor="w", pady=(0, 6))
-        elif not conflict.safe:
-            ttk.Label(
-                card,
-                text=f"Self-review flagged this resolution: {conflict.safety_notes}",
-                foreground="#cf222e",
-                wraplength=820,
-                justify=tk.LEFT,
-            ).pack(anchor="w", pady=(0, 6))
-
-        markers_box = ttk.LabelFrame(card, text="Original conflict markers", padding=6)
-        markers_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
-        markers_frame, markers_text = self._make_scroll_text(
-            markers_box,
-            height=min(12, max(3, conflict.marker_text.count("\n") + 2)),
-            wrap=tk.NONE,
-            font=("Consolas", 9),
-        )
-        markers_text.insert("1.0", conflict.marker_text)
-        markers_text.configure(state=tk.DISABLED)
-        markers_frame.pack(fill=tk.BOTH, expand=True)
-
-        resolution_box = ttk.LabelFrame(card, text="Proposed resolution (edit before pushing)", padding=6)
-        resolution_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
-        body = conflict.resolved_content or ""
-        resolution_frame, resolution_text = self._make_scroll_text(
-            resolution_box, height=min(20, max(4, body.count("\n") + 2)), wrap=tk.NONE, font=("Consolas", 9)
-        )
-        resolution_text.insert("1.0", body)
-        resolution_frame.pack(fill=tk.BOTH, expand=True)
-        self._resolution_widgets[id(conflict)] = resolution_text
-
-    def _collect_resolutions(self) -> bool:
-        """Copies edited widget text back onto each conflict. Returns False
-        (and shows an error) if a content conflict was left empty."""
-        for conflict in self._conflicts:
-            widget = self._resolution_widgets.get(id(conflict))
-            if conflict.kind == "delete_conflict":
-                choice = self._delete_choice_vars[id(conflict)].get()
-                if choice == "delete":
-                    conflict.resolved_content = None
-                else:
-                    conflict.resolved_content = widget.get("1.0", "end-1c") if widget else ""
-                continue
-            text = widget.get("1.0", "end-1c") if widget else ""
-            if not text.strip():
-                messagebox.showerror(
-                    "Empty resolution",
-                    f"The resolution for {conflict.path} can't be empty.",
-                    parent=self,
-                )
-                return False
-            conflict.resolved_content = text
-        return True
-
-    def _push(self) -> None:
-        if not self._collect_resolutions():
-            return
-        if not messagebox.askyesno(
-            "Push merge commit",
-            f"Push a merge commit of {self.info.base_branch} into {self.info.head_branch} "
-            f"on {self.diff.ref.full_name}#{self.diff.ref.number}?\n\n"
-            "This pushes directly to the PR branch and can't be undone from here.",
-            parent=self,
-        ):
-            return
-
-        self.push_btn.configure(state=tk.DISABLED)
-        self.push_status_var.set("Pushing…")
-
-        def on_merge_event(event: dict) -> None:
-            text = str(event.get("text") or "")
-            if text:
-                self.after(0, lambda t=text: self.push_status_var.set(t))
-
-        def worker() -> None:
-            try:
-                message = (
-                    f"Merge {self.info.base_branch} into {self.info.head_branch}\n\n"
-                    "Conflict resolution drafted by Peer Review App / Claude, reviewed before push."
-                )
-                commit_sha = self.session.apply_and_push(message, on_event=on_merge_event)
-                self.after(0, lambda sha=commit_sha: self._push_succeeded(sha))
-            except Exception as exc:  # noqa: BLE001
-                err = str(exc)
-                self.after(0, lambda e=err: self._push_failed(e))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _push_succeeded(self, commit_sha: str) -> None:
-        self.push_status_var.set(f"Pushed {commit_sha[:12]} ✓")
-        messagebox.showinfo(
-            "Merge commit pushed",
-            f"Pushed merge commit {commit_sha[:12]} to {self.info.head_branch}.",
-            parent=self,
-        )
-        self.destroy()
-
-    def _push_failed(self, error: str) -> None:
-        self.push_btn.configure(state=tk.NORMAL)
-        self.push_status_var.set("")
-        messagebox.showerror("Push failed", error, parent=self)
-
-    def _on_close(self) -> None:
-        self.session.close()
-        self.destroy()
-
-
-class LintFixDialog(tk.Toplevel):
-    """Shows lint/style issues Claude found on the lines this PR actually
-    changed, plus its proposed fix per file. Queued fixes get pushed as a
-    single commit via Apply all -- same batching UX as the bot-comment fix
-    flow, minus the reply-to-a-comment step (there's no GitHub thread to
-    reply to for a self-found lint issue)."""
-
-    def __init__(
-        self,
-        master: tk.Misc,
-        *,
-        diff: PullRequestDiff,
-        findings: list[LintFinding],
-        token: str,
-    ) -> None:
-        super().__init__(master)
-        self.diff = diff
-        self.token = token
-        self._findings = list(findings)
-        self._queue_vars: dict[int, tk.BooleanVar] = {}
-        self._card_state: dict[int, dict] = {}
-        self.title(f"Lint issues — {diff.ref.full_name}#{diff.ref.number}")
-        self.resizable(True, True)
-        self.transient(master)
-        self.geometry("880x680")
-
-        header = ttk.Frame(self, padding=(12, 12, 12, 4))
-        header.pack(fill=tk.X)
-        fixable_count = sum(1 for f in findings if f.fix is not None and f.safe)
-        ttk.Label(
-            header,
-            text=(
-                f"{diff.title}\n"
-                f"{len(findings)} file(s) with lint issues on the lines this PR changed — "
-                f"{fixable_count} with a fix ready.\n"
-                "Check the fixes you want, then Apply all pushes them as one commit."
-            ),
-            justify=tk.LEFT,
-        ).pack(anchor="w")
-
-        canvas = tk.Canvas(self, highlightthickness=0)
-        vscroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=vscroll.set)
-        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0), pady=(4, 12))
-
-        inner = ttk.Frame(canvas)
-        window = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
-        canvas.bind(
-            "<Enter>",
-            lambda _e: canvas.bind_all(
-                "<MouseWheel>",
-                lambda ev: canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units"),
-            ),
-        )
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
-
-        for finding in findings:
-            self._build_card(inner, finding)
-
-        if fixable_count:
-            bottom_bar = ttk.Frame(self, padding=(12, 0, 12, 4))
-            bottom_bar.pack(fill=tk.X)
-            self.apply_all_status_var = tk.StringVar(value="")
-            ttk.Label(bottom_bar, textvariable=self.apply_all_status_var).pack(side=tk.LEFT)
-            self.apply_all_btn = ttk.Button(
-                bottom_bar, text="Apply all", state=tk.DISABLED, command=self._apply_all
-            )
-            self.apply_all_btn.pack(side=tk.RIGHT)
-
-        ttk.Button(self, text="Close", command=self.destroy).pack(pady=(0, 10))
-
-    def _make_scroll_text(
-        self, parent: tk.Misc, *, height: int, wrap: str = tk.WORD, font=None
-    ) -> tuple[ttk.Frame, tk.Text]:
-        frame = ttk.Frame(parent)
-        kwargs: dict = {"height": height, "wrap": wrap}
-        if font:
-            kwargs["font"] = font
-        text = tk.Text(frame, **kwargs)
-        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
-        text.configure(yscrollcommand=scroll.set)
-        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        return frame, text
-
-    def _build_card(self, parent: tk.Misc, finding: LintFinding) -> None:
-        card = ttk.LabelFrame(parent, text=finding.path, padding=10)
-        card.pack(fill=tk.X, expand=True, padx=4, pady=6)
-
-        issues_text = "\n".join(f"- {issue}" for issue in finding.issues) or "(no detail given)"
-        ttk.Label(card, text=issues_text, wraplength=760, justify=tk.LEFT).pack(
-            anchor="w", pady=(0, 6)
-        )
-
-        if finding.fix is None:
-            ttk.Label(
-                card,
-                text=finding.safety_notes or "No fix drafted.",
-                foreground="#9a6700",
-                wraplength=760,
-                justify=tk.LEFT,
-            ).pack(anchor="w", pady=(0, 6))
-            return
-
-        if not finding.safe:
-            ttk.Label(
-                card,
-                text=f"Self-review flagged this fix: {finding.safety_notes}",
-                foreground="#cf222e",
-                wraplength=760,
-                justify=tk.LEFT,
-            ).pack(anchor="w", pady=(0, 6))
-
-        fix_box = ttk.LabelFrame(card, text="Proposed fix", padding=6)
-        fix_box.pack(fill=tk.X, pady=(0, 6))
-        diff_text = finding.fix.diff_text or "(no textual difference detected)"
-        lines = diff_text.splitlines()
-        shown_lines = lines[:60]
-        shown = "\n".join(shown_lines)
-        if len(lines) > 60:
-            shown += f"\n… ({len(lines) - 60} more lines)"
-        fix_text = tk.Text(
-            fix_box, height=min(20, max(4, len(shown_lines) + 1)), wrap=tk.NONE, font=("Consolas", 9)
-        )
-        fix_text.insert("1.0", shown)
-        fix_text.configure(state=tk.DISABLED)
-        fix_text.pack(fill=tk.X)
-
-        if not finding.safe:
-            return  # unsafe fixes are shown for transparency but can't be queued
-
-        status_var = tk.StringVar(value="")
-        action_row = ttk.Frame(card)
-        action_row.pack(fill=tk.X, pady=(4, 0))
-        queue_var = tk.BooleanVar(value=False)
-        check = ttk.Checkbutton(
-            action_row,
-            text="Queue this fix for Apply all",
-            variable=queue_var,
-            command=self._update_apply_all_state,
-        )
-        check.pack(side=tk.LEFT)
-        ttk.Label(action_row, textvariable=status_var).pack(side=tk.LEFT, padx=(10, 0))
-        self._queue_vars[id(finding)] = queue_var
-        self._card_state[id(finding)] = {"check": check, "status_var": status_var}
-
-    def _update_apply_all_state(self) -> None:
-        n = sum(1 for var in self._queue_vars.values() if var.get())
-        if n == 0:
-            self.apply_all_btn.configure(state=tk.DISABLED, text="Apply all")
-        else:
-            self.apply_all_btn.configure(state=tk.NORMAL, text=f"Apply all ({n}) as one commit")
-
-    def _apply_all(self) -> None:
-        selected = [
-            f
-            for f in self._findings
-            if id(f) in self._queue_vars and self._queue_vars[id(f)].get()
-        ]
-        if not selected:
-            return
-
-        file_count = len(selected)
-        if not messagebox.askyesno(
-            "Apply all",
-            f"Apply {file_count} lint fix(es) as one commit to {self.diff.head_branch}?\n\n"
-            "This pushes directly to the PR branch and can't be undone from here.",
-            parent=self,
-        ):
-            return
-
-        self.apply_all_btn.configure(state=tk.DISABLED)
-        self.apply_all_status_var.set("Applying…")
-        for finding in selected:
-            state = self._card_state[id(finding)]
-            state["check"].configure(state=tk.DISABLED)
-            state["status_var"].set("Queued…")
-
-        def worker() -> None:
-            try:
-                apply_lint_fixes_batch(self.diff, selected, self.token)
-                self.after(0, lambda: self._apply_succeeded(selected))
-            except Exception as exc:  # noqa: BLE001
-                err = str(exc)
-                self.after(0, lambda e=err: self._apply_failed(selected, e))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _apply_succeeded(self, findings: list[LintFinding]) -> None:
-        self.apply_all_status_var.set("Applied ✓")
-        for finding in findings:
-            self._card_state[id(finding)]["status_var"].set("Applied ✓")
-
-    def _apply_failed(self, findings: list[LintFinding], error: str) -> None:
-        for finding in findings:
-            state = self._card_state[id(finding)]
-            state["check"].configure(state=tk.NORMAL)
-            state["status_var"].set("")
-        self.apply_all_status_var.set("")
-        self._update_apply_all_state()
-        messagebox.showerror("Apply all failed", error, parent=self)
-
-
-class SubmitReviewDialog(tk.Toplevel):
-    """Review, edit, and post the AI-drafted comments to GitHub as real PR
-    review comments — one card per parsed comment, each with its own Submit
-    button so a file with several comments can be posted selectively rather
-    than all-or-nothing."""
-
-    def __init__(
-        self,
-        master: tk.Misc,
-        *,
-        diff: PullRequestDiff,
-        comments: list[ReviewComment],
-        token: str,
-    ) -> None:
-        super().__init__(master)
-        self.title("Submit review comments to GitHub")
-        self.geometry("820x640")
-        self.transient(master)
-        self.grab_set()
-
-        self.diff = diff
-        self.token = token
-        self._comments = comments
-        self._text_widgets: dict[int, tk.Text] = {}
-        self._status_vars: dict[int, tk.StringVar] = {}
-        self._submit_buttons: dict[int, ttk.Button] = {}
-
-        header = ttk.Frame(self, padding=(12, 10, 12, 4))
-        header.pack(fill=tk.X)
-        ttk.Label(
-            header,
-            text=(
-                f"{diff.ref.full_name}#{diff.ref.number} — "
-                f"{len(comments)} comment(s) parsed from the review"
-            ),
-            font=("Segoe UI", 10, "bold"),
-        ).pack(anchor="w")
-        ttk.Label(
-            header,
-            text="Edit any comment's text, then submit it on its own — nothing posts until you click Submit on that card.",
-            foreground="#57606a",
-        ).pack(anchor="w")
-
-        canvas = tk.Canvas(self, highlightthickness=0)
-        vscroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=vscroll.set)
-        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
-
-        inner = ttk.Frame(canvas)
-        window = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
-        canvas.bind(
-            "<Enter>",
-            lambda _e: canvas.bind_all(
-                "<MouseWheel>",
-                lambda ev: canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units"),
-            ),
-        )
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
-
-        for comment in comments:
-            self._build_card(inner, comment)
-
-        bottom = ttk.Frame(self, padding=(12, 6, 12, 10))
-        bottom.pack(fill=tk.X)
-        ttk.Button(bottom, text="Close", command=self.destroy).pack(side=tk.RIGHT)
-
-    def _build_card(self, parent: tk.Misc, comment: ReviewComment) -> None:
-        location = (
-            f"{comment.file_path}:{comment.line} ({comment.side})"
-            if comment.line is not None
-            else f"{comment.file_path} (no line match — posted as a general PR comment)"
-        )
-        sev = (comment.severity or "nit").upper()
-        card = ttk.LabelFrame(parent, text=f"[{sev}] {location}", padding=8)
-        card.pack(fill=tk.X, expand=True, padx=4, pady=6)
-
-        text_frame = ttk.Frame(card)
-        text_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
-        body = comment.comment.strip()
-        text = tk.Text(
-            text_frame, height=min(8, max(2, body.count("\n") + 2)), wrap=tk.WORD
-        )
-        text.insert("1.0", body)
-        scroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text.yview)
-        text.configure(yscrollcommand=scroll.set)
-        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self._text_widgets[id(comment)] = text
-
-        action_row = ttk.Frame(card)
-        action_row.pack(fill=tk.X)
-        submit_btn = ttk.Button(action_row, text="Submit")
-        submit_btn.configure(command=lambda c=comment, b=submit_btn: self._submit_one(c, b))
-        submit_btn.pack(side=tk.LEFT)
-        self._submit_buttons[id(comment)] = submit_btn
-
-        status_var = tk.StringVar(value="")
-        ttk.Label(action_row, textvariable=status_var, foreground="#57606a").pack(
-            side=tk.LEFT, padx=(10, 0)
-        )
-        self._status_vars[id(comment)] = status_var
-
-    def _submit_one(self, comment: ReviewComment, button: ttk.Button) -> None:
-        edited = self._text_widgets[id(comment)].get("1.0", "end-1c").strip()
-        comment.comment = edited or comment.comment
-        status_var = self._status_vars[id(comment)]
-        button.configure(state=tk.DISABLED)
-        status_var.set("posting…")
-
-        def worker() -> None:
-            try:
-                post_review_comment(self.diff, comment, self.token)
-            except Exception as exc:  # noqa: BLE001
-                err = str(exc)
-                self.after(0, lambda: self._submit_failed(button, status_var, err))
-            else:
-                self.after(0, lambda: self._submit_succeeded(status_var))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _submit_succeeded(self, status_var: tk.StringVar) -> None:
-        status_var.set("posted ✓")
-
-    def _submit_failed(self, button: ttk.Button, status_var: tk.StringVar, error: str) -> None:
-        button.configure(state=tk.NORMAL)
-        status_var.set("failed")
-        messagebox.showerror("Failed to post comment", error, parent=self)
-
-
-class SettingsDialog(tk.Toplevel):
-    def __init__(self, master: tk.Misc) -> None:
-        super().__init__(master)
-        self.title("Settings")
-        self.resizable(True, True)
-        self.transient(master)
-        self.grab_set()
-        self.config_data = load_config()
-
-        frame = ttk.Frame(self, padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        auth = ttk.LabelFrame(frame, text="Sign in (browser / SSO)", padding=8)
-        auth.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-
-        gh_row = ttk.Frame(auth)
-        gh_row.grid(row=0, column=0, columnspan=2, sticky="w")
-        self.github_light = StatusLight(gh_row)
-        self.github_light.pack(side=tk.LEFT)
-        self.github_status_var = tk.StringVar(value="GitHub: checking…")
-        ttk.Label(gh_row, textvariable=self.github_status_var).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
-
-        cl_row = ttk.Frame(auth)
-        cl_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 8))
-        self.claude_light = StatusLight(cl_row)
-        self.claude_light.pack(side=tk.LEFT)
-        self.claude_status_var = tk.StringVar(value="Claude: checking…")
-        ttk.Label(cl_row, textvariable=self.claude_status_var).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
-
-        ttk.Button(
-            auth,
-            text="Login with GitHub (browser)",
-            command=self._github_login,
-        ).grid(row=2, column=0, sticky="w", padx=(0, 8))
-        ttk.Button(
-            auth,
-            text="Login with Claude SSO",
-            command=self._claude_login,
-        ).grid(row=2, column=1, sticky="w")
-        ttk.Button(auth, text="Refresh status", command=self._refresh_status).grid(
-            row=3, column=0, sticky="w", pady=(8, 0)
-        )
-        ttk.Button(auth, text="Clear all auth", command=self._clear_all_auth).grid(
-            row=3, column=1, sticky="w", pady=(8, 0)
-        )
-
-        ttk.Label(frame, text="GitHub token (optional)").grid(row=1, column=0, sticky="w")
-        self.token_var = tk.StringVar(value=self.config_data.get("github_token", ""))
-        ttk.Entry(frame, textvariable=self.token_var, width=56, show="*").grid(
-            row=1, column=1, pady=4, sticky="ew"
-        )
-
-        self.wsl_auth_var = tk.BooleanVar(
-            value=bool(self.config_data.get("use_wsl_github_auth", True))
-        )
-        ttk.Checkbutton(
-            frame,
-            text="Use WSL / Windows saved GitHub credentials when token is blank",
-            variable=self.wsl_auth_var,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
-
-        ttk.Label(frame, text="Claude mode").grid(row=3, column=0, sticky="w")
-        self.mode_var = tk.StringVar(value=self.config_data.get("claude_mode", "cli"))
-        mode = ttk.Combobox(
-            frame,
-            textvariable=self.mode_var,
-            values=["cli", "wsl", "api"],
-            state="readonly",
-            width=12,
-        )
-        mode.grid(row=3, column=1, sticky="w", pady=4)
-
-        self.wsl_claude_var = tk.BooleanVar(
-            value=bool(self.config_data.get("use_wsl_claude", True))
-        )
-        ttk.Checkbutton(
-            frame,
-            text="Prefer WSL Claude Code (uses your SSO session)",
-            variable=self.wsl_claude_var,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
-
-        ttk.Label(frame, text="Claude SSO email").grid(row=5, column=0, sticky="w")
-        self.email_var = tk.StringVar(
-            value=self.config_data.get(
-                "claude_sso_email", "czyrus.tuazon@traderinteractive.com"
-            )
-        )
-        ttk.Entry(frame, textvariable=self.email_var, width=56).grid(
-            row=5, column=1, pady=4, sticky="ew"
-        )
-
-        ttk.Label(frame, text="Claude CLI path").grid(row=6, column=0, sticky="w")
-        self.cli_var = tk.StringVar(value=self.config_data.get("claude_cli_path", "claude"))
-        ttk.Entry(frame, textvariable=self.cli_var, width=56).grid(
-            row=6, column=1, pady=4, sticky="ew"
-        )
-
-        ttk.Label(frame, text="Anthropic API key").grid(row=7, column=0, sticky="w")
-        self.api_var = tk.StringVar(value=self.config_data.get("anthropic_api_key", ""))
-        ttk.Entry(frame, textvariable=self.api_var, width=56, show="*").grid(
-            row=7, column=1, pady=4, sticky="ew"
-        )
-
-        ttk.Label(frame, text="Claude model (API)").grid(row=8, column=0, sticky="w")
-        self.model_var = tk.StringVar(
-            value=self.config_data.get("claude_model", "claude-sonnet-4-20250514")
-        )
-        ttk.Entry(frame, textvariable=self.model_var, width=56).grid(
-            row=8, column=1, pady=4, sticky="ew"
-        )
-
-        ttk.Label(frame, text="Review-comment triage model").grid(row=9, column=0, sticky="w")
-        self.cheap_model_var = tk.StringVar(
-            value=self.config_data.get("bot_cheap_model", "claude-haiku-4-5-20251001")
-        )
-        ttk.Entry(frame, textvariable=self.cheap_model_var, width=56).grid(
-            row=9, column=1, pady=4, sticky="ew"
-        )
-        ttk.Label(
-            frame,
-            text="Used only to triage bot/reviewer comments (valid/invalid) -- fix-drafting and "
-            "self-review still use the model above. Leave blank to use that model everywhere.",
-            justify=tk.LEFT,
-            foreground="#666",
-        ).grid(row=10, column=0, columnspan=2, sticky="w")
-
-        help_text = (
-            "GitHub browser login uses Git Credential Manager (opens a webpage only).\n"
-            "Claude SSO login opens the browser via WSL — no extra terminal windows.\n"
-            "Token/API key fields are optional fallbacks.\n"
-            "Auth light status is saved and restored the next time you open the app."
-        )
-        ttk.Label(frame, text=help_text, justify=tk.LEFT).grid(
-            row=11, column=0, columnspan=2, sticky="w", pady=(8, 0)
-        )
-
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=12, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(buttons, text="Save", command=self._save).pack(side=tk.RIGHT)
-
-        frame.columnconfigure(1, weight=1)
-        self.geometry("720x560")
-        self._restore_cached_auth_status()
-        self.after(100, self._refresh_status)
-
-    def _restore_cached_auth_status(self) -> None:
-        cached = load_auth_status()
-        gh = cached.get("github") or {}
-        cl = cached.get("claude") or {}
-        if gh.get("ok") is not None:
-            self.github_light.set("ok" if gh.get("ok") else "error")
-            detail = gh.get("detail") or ""
-            self.github_status_var.set(
-                f"GitHub: signed in — {detail}" if gh.get("ok") else f"GitHub: {detail}"
-            )
-        else:
-            self.github_light.set("idle")
-            self.github_status_var.set("GitHub: not checked yet")
-        if cl.get("ok") is not None:
-            self.claude_light.set("ok" if cl.get("ok") else "error")
-            detail = cl.get("detail") or ""
-            self.claude_status_var.set(
-                f"Claude: signed in as {detail}" if cl.get("ok") else f"Claude: {detail}"
-            )
-        else:
-            self.claude_light.set("idle")
-            self.claude_status_var.set("Claude: not checked yet")
-
-    def _refresh_status(self) -> None:
-        self.github_light.set("checking")
-        self.claude_light.set("checking")
-        self.github_status_var.set("GitHub: checking…")
-        self.claude_status_var.set("Claude: checking…")
-
-        token = self.token_var.get().strip()
-        use_wsl = bool(self.wsl_auth_var.get())
-
-        def worker() -> None:
-            from app.auth_flows import check_claude_auth, check_github_auth
-
-            gh_ok, gh_detail = check_github_auth(token, use_wsl=use_wsl)
-            cl_ok, cl_detail = check_claude_auth()
-            self.after(
-                0,
-                lambda: self._set_status(gh_ok, gh_detail, cl_ok, cl_detail),
-            )
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _set_status(
-        self, gh_ok: bool, gh_detail: str, cl_ok: bool, cl_detail: str
-    ) -> None:
-        self.github_light.set("ok" if gh_ok else "error")
-        self.claude_light.set("ok" if cl_ok else "error")
-        self.github_status_var.set(
-            f"GitHub: signed in — {gh_detail}" if gh_ok else f"GitHub: {gh_detail}"
-        )
-        self.claude_status_var.set(
-            f"Claude: signed in as {cl_detail}" if cl_ok else f"Claude: {cl_detail}"
-        )
-        save_auth_status(
-            github_ok=gh_ok,
-            github_detail=gh_detail,
-            claude_ok=cl_ok,
-            claude_detail=cl_detail,
-        )
-        # Keep main window lights in sync if it exists.
-        master = self.master
-        if hasattr(master, "_apply_auth_lights"):
-            master._apply_auth_lights(gh_ok, gh_detail, cl_ok, cl_detail)
-
-    def _clear_all_auth(self) -> None:
-        if not messagebox.askyesno(
-            "Clear all auth",
-            "Sign out of GitHub and Claude for this app?\n\n"
-            "This clears WSL/Windows GitHub credentials and the Claude SSO session.",
-            parent=self,
-        ):
-            return
-        from app.auth_flows import clear_all_auth
-
-        # Also drop any token stored in app settings.
-        self.token_var.set("")
-        self.api_var.set("")
-        notes = clear_all_auth()
-        clear_auth_status()
-        cfg = load_config()
-        cfg["github_token"] = ""
-        cfg["anthropic_api_key"] = ""
-        save_config(cfg)
-        self._set_status(False, "cleared", False, "cleared")
-        messagebox.showinfo("Auth cleared", notes, parent=self)
-
-    def _github_login(self) -> None:
-        from app.auth_flows import start_github_web_login
-
-        self.github_light.set("checking")
-        try:
-            message = start_github_web_login(force=True)
-        except Exception as exc:  # noqa: BLE001
-            self.github_light.set("error")
-            messagebox.showerror("GitHub login", str(exc), parent=self)
-            return
-        messagebox.showinfo("GitHub login", message, parent=self)
-        self.after(4000, self._refresh_status)
-
-    def _claude_login(self) -> None:
-        from app.auth_flows import start_claude_sso_login
-
-        self.claude_light.set("checking")
-        try:
-            message = start_claude_sso_login(email=self.email_var.get().strip())
-        except Exception as exc:  # noqa: BLE001
-            self.claude_light.set("error")
-            messagebox.showerror("Claude SSO login", str(exc), parent=self)
-            return
-        messagebox.showinfo("Claude SSO login", message, parent=self)
-        self.after(4000, self._refresh_status)
-
-    def _save(self) -> None:
-        save_config(
-            {
-                "github_token": self.token_var.get().strip(),
-                "use_wsl_github_auth": bool(self.wsl_auth_var.get()),
-                "use_wsl_claude": bool(self.wsl_claude_var.get()),
-                "claude_mode": self.mode_var.get().strip() or "cli",
-                "claude_cli_path": self.cli_var.get().strip() or "claude",
-                "claude_sso_email": self.email_var.get().strip(),
-                "anthropic_api_key": self.api_var.get().strip(),
-                "claude_model": self.model_var.get().strip()
-                or "claude-sonnet-4-20250514",
-                "bot_cheap_model": self.cheap_model_var.get().strip(),
-            }
-        )
-        self.destroy()
-
-
-class PeerReviewApp(tk.Tk):
+from ui.dialogs import BotReviewDialog, LintFixDialog, MergeConflictDialog
+from ui.gate_dialog import RunGateDialog
+from ui.history_tab import HistoryTabMixin
+from ui.prompts_tab import PromptsTabMixin
+from ui.settings_dialog import SettingsDialog
+from ui.submit_dialog import SubmitReviewDialog
+from ui.widgets import (
+    TERMINAL_BG,
+    Collapsible,
+    HelpIcon,
+    LinkButton,
+    MenuEntry,
+    PrimaryButton,
+    Section,
+    StatusLight,
+    ThinkingIndicator,
+    Tooltip,
+    apply_theme,
+    soften_text,
+    tip,
+)
+
+
+class PeerReviewApp(PromptsTabMixin, HistoryTabMixin, tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Peer Review App")
@@ -1574,14 +98,19 @@ class PeerReviewApp(tk.Tk):
         self._job_usage = {"input": 0, "output": 0}
         self._session_usage = {"input": 0, "output": 0}
 
+        apply_theme(self)
         self._build_menu()
+        # Packed before the notebook so it keeps its row at the bottom.
+        self.status_bar = ttk.Frame(self, style="Statusbar.TFrame")
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(self, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
         notebook = ttk.Notebook(self)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
         self.notebook = notebook
 
-        self.review_tab = ttk.Frame(notebook, padding=8)
-        self.prompts_tab = ttk.Frame(notebook, padding=8)
-        self.history_tab = ttk.Frame(notebook, padding=8)
+        self.review_tab = ttk.Frame(notebook, padding=(14, 12))
+        self.prompts_tab = ttk.Frame(notebook, padding=(14, 12))
+        self.history_tab = ttk.Frame(notebook, padding=(14, 12))
         notebook.add(self.review_tab, text="Review")
         notebook.add(self.prompts_tab, text="Prompts")
         notebook.add(self.history_tab, text="History")
@@ -1617,203 +146,212 @@ class PeerReviewApp(tk.Tk):
     def _build_review_tab(self) -> None:
         tab = self.review_tab
 
-        top = ttk.LabelFrame(tab, text="Pull request", padding=8)
-        top.pack(fill=tk.X)
-
-        ttk.Label(top, text="PR link").grid(row=0, column=0, sticky="w")
+        # Every section stacks in one column so inputs and text areas share a
+        # left edge; whitespace, not borders, separates the sections.
+        pr_box = Section(tab, "Pull request")
+        pr_box.pack(fill=tk.X)
+        pr_row = ttk.Frame(pr_box.body)
+        pr_row.pack(fill=tk.X)
         self.pr_url_var = tk.StringVar()
-        pr_entry = ttk.Entry(top, textvariable=self.pr_url_var)
-        pr_entry.grid(row=0, column=1, sticky="ew", padx=6)
-        detect_row = ttk.Frame(top)
-        detect_row.grid(row=0, column=2, sticky="e")
-        ttk.Button(detect_row, text="Detect repo", command=self.detect_repo).pack(
-            side=tk.LEFT
-        )
-        self.repo_light = StatusLight(detect_row)
-        self.repo_light.pack(side=tk.LEFT, padx=(8, 0))
-        self.repo_light_status_var = tk.StringVar(value="")
-        top.columnconfigure(1, weight=1)
+        pr_entry = ttk.Entry(pr_row, textvariable=self.pr_url_var)
+        pr_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=2)
+        tip(pr_entry, "Paste a GitHub pull request URL, e.g. https://github.com/owner/repo/pull/123")
+        self.repo_light = StatusLight(pr_row)
+        self.repo_light.pack(side=tk.RIGHT, padx=(8, 0))
+        tip(
+            ttk.Button(pr_row, text="Detect repo", command=self.detect_repo),
+            "Check that GitHub can reach this PR, load the repo's reviewer prompts, "
+            "and pre-fill Story from any linked Jira tickets.",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
 
-        ttk.Label(top, text="Detected repo").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        repo_status = ttk.Frame(pr_box.body)
+        repo_status.pack(fill=tk.X, pady=(4, 0))
         self.repo_label_var = tk.StringVar(value="—")
-        repo_status = ttk.Frame(top)
-        repo_status.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Label(repo_status, textvariable=self.repo_label_var).pack(side=tk.LEFT)
-        ttk.Label(repo_status, textvariable=self.repo_light_status_var).pack(
+        self.repo_light_status_var = tk.StringVar(value="")
+        ttk.Label(repo_status, text="Repo:", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Label(repo_status, textvariable=self.repo_label_var).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(repo_status, textvariable=self.repo_light_status_var, style="Muted.TLabel").pack(
             side=tk.LEFT, padx=(10, 0)
         )
 
-        prompt_box = ttk.LabelFrame(tab, text="Reviewer prompt", padding=8)
-        prompt_box.pack(fill=tk.X, pady=(8, 0))
-
+        prompt_box = Section(tab, "Reviewer prompt")
+        prompt_box.pack(fill=tk.X, pady=(14, 0))
         self.prompt_label_var = tk.StringVar(value="No prompts yet")
-        ttk.Label(prompt_box, textvariable=self.prompt_label_var).grid(
-            row=0, column=0, columnspan=3, sticky="w"
+        ttk.Label(prompt_box.header, textvariable=self.prompt_label_var, style="Muted.TLabel").pack(
+            side=tk.LEFT, padx=(10, 0)
         )
-
-        btns = ttk.Frame(prompt_box)
-        btns.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Button(btns, text="◀ Prev", command=self.cycle_prev).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(btns, text="Next ▶", command=self.cycle_next).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Refresh list", command=self.refresh_prompts_ui).pack(
-            side=tk.LEFT, padx=4
-        )
-
+        tip(
+            ttk.Button(prompt_box.header, text="⟳", width=3, command=self.refresh_prompts_ui),
+            "Reload the prompt list (picks up edits made in the Prompts tab).",
+        ).pack(side=tk.RIGHT)
+        tip(
+            ttk.Button(prompt_box.header, text="▶", width=3, command=self.cycle_next),
+            "Next reviewer prompt for this repo.",
+        ).pack(side=tk.RIGHT, padx=(0, 4))
+        tip(
+            ttk.Button(prompt_box.header, text="◀", width=3, command=self.cycle_prev),
+            "Previous reviewer prompt for this repo.",
+        ).pack(side=tk.RIGHT, padx=(0, 4))
         self.prompt_preview = scrolledtext.ScrolledText(
-            prompt_box, height=6, wrap=tk.WORD, state=tk.DISABLED
+            prompt_box.body, height=5, wrap=tk.WORD, state=tk.DISABLED
         )
-        self.prompt_preview.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        prompt_box.columnconfigure(0, weight=1)
+        soften_text(self.prompt_preview)
+        self.prompt_preview.pack(fill=tk.X)
 
-        story_box = ttk.LabelFrame(
-            tab, text="Story / explanation / custom prompt", padding=8
-        )
-        story_box.pack(fill=tk.X, pady=(8, 0))
-        self.story_text = scrolledtext.ScrolledText(story_box, height=4, wrap=tk.WORD)
+        story_box = Section(tab, "Story / explanation / custom prompt")
+        story_box.pack(fill=tk.X, pady=(14, 0))
+        HelpIcon(
+            story_box.header,
+            "Context for the reviewer: the ticket, intent or anything Claude should know. "
+            "Detect repo fills it from linked Jira tickets when it's empty. "
+            "Ask Claude sends only this text as the question.",
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        self.story_text = scrolledtext.ScrolledText(story_box.body, height=4, wrap=tk.WORD)
+        soften_text(self.story_text)
         self.story_text.pack(fill=tk.BOTH, expand=True)
 
         follow_row = ttk.Frame(tab)
-        follow_row.pack(fill=tk.X, pady=(6, 0))
+        follow_row.pack(fill=tk.X, pady=(8, 0))
         self.follow_up_var = tk.BooleanVar(value=True)
-        self.follow_up_check = ttk.Checkbutton(
-            follow_row,
-            text="Follow-up pass: skip already-reported findings, new blocker/major only",
-            variable=self.follow_up_var,
-        )
+        self.follow_up_check = ttk.Checkbutton(follow_row, text="Re-review", variable=self.follow_up_var)
         self.follow_up_check.pack(side=tk.LEFT)
+        HelpIcon(
+            follow_row,
+            "Re-review: report on findings from earlier reviews of this PR (fixed or still open), "
+            "and only raise new findings at the follow-up floor (major by default).",
+        ).pack(side=tk.LEFT, padx=(2, 0))
         self.follow_up_info_var = tk.StringVar(value="")
-        ttk.Label(
-            follow_row, textvariable=self.follow_up_info_var, foreground="#666"
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(follow_row, textvariable=self.follow_up_info_var, style="Muted.TLabel").pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
         self.pr_url_var.trace_add("write", lambda *_: self._refresh_follow_up_info())
 
-        # Primary actions — keep this row sparse.
+        # Review settings. "auto" defers to .github/pr-review.yml, then the
+        # defaults in Settings; anything else overrides both for this run.
+        advanced = Collapsible(tab, "Advanced options")
+        advanced.pack(fill=tk.X, pady=(6, 0))
+        self.advanced_options = advanced
+        self.model_choice_var = tk.StringVar(value="auto")
+        self.effort_var = tk.StringVar(value="auto")
+        self.mode_choice_var = tk.StringVar(value="auto")
+        self.verify_var = tk.StringVar(value="auto")
+        auto_note = "auto = the repo's .github/pr-review.yml, then the defaults in File > Settings."
+        settings = [
+            ("Model", self.model_choice_var, ["auto", *REVIEW_MODEL_CHOICES], 18,
+             "Claude model for this run. " + auto_note),
+            ("Effort", self.effort_var, ["auto", *EFFORTS], 8,
+             "How hard the model thinks. Higher effort is slower and costs more. "
+             "Needs CLI/WSL or API mode; Inspect shows what will apply. " + auto_note),
+            ("Mode", self.mode_choice_var, ["auto", "agentic", "single-shot"], 11,
+             "agentic: Claude can open files in a local checkout of the repo. "
+             "single-shot: Claude sees only the diff and context. " + auto_note),
+            ("Verify findings", self.verify_var, ["auto", "on", "off"], 5,
+             "Run a second pass that re-checks each finding and drops false positives. " + auto_note),
+        ]
+        for col, (label, var, values, width, help_text) in enumerate(settings):
+            cell = ttk.Frame(advanced.body)
+            cell.grid(row=0, column=col, sticky="w", padx=(0, 18))
+            ttk.Label(cell, text=label).pack(side=tk.LEFT)
+            HelpIcon(cell, help_text).pack(side=tk.LEFT, padx=(2, 4))
+            ttk.Combobox(cell, textvariable=var, values=values, state="readonly", width=width).pack(side=tk.LEFT)
+            var.trace_add("write", lambda *_: self._update_advanced_summary())
+        self._update_advanced_summary()
+
         action_row = ttk.Frame(tab)
-        action_row.pack(fill=tk.X, pady=(10, 2))
-        self.run_btn = ttk.Button(
-            action_row, text="Run peer review", command=self.start_review
-        )
+        action_row.pack(fill=tk.X, pady=(14, 10))
+        self.run_btn = PrimaryButton(action_row, text="Run peer review", command=self.start_review)
         self.run_btn.pack(side=tk.LEFT)
-        self.explain_btn = ttk.Button(
-            action_row, text="Explain PR", command=self.start_explain
+        tip(
+            self.run_btn,
+            "Fetch the PR diff and have Claude review it with the selected reviewer prompt. "
+            "Findings appear inline in the diff below, where you can edit them before submitting to GitHub.",
         )
-        self.explain_btn.pack(side=tk.LEFT, padx=(6, 0))
-        self.ask_btn = ttk.Button(
-            action_row, text="Ask Claude", command=self.start_ask
-        )
-        self.ask_btn.pack(side=tk.LEFT, padx=(6, 0))
-        self.bot_check_btn = ttk.Button(
-            action_row, text="Check review comments", command=self.start_bot_check
-        )
-        self.bot_check_btn.pack(side=tk.LEFT, padx=(6, 0))
-        self.merge_conflict_btn = ttk.Button(
-            action_row, text="Resolve merge conflict", command=self.start_merge_conflict_check
-        )
-        self.merge_conflict_btn.pack(side=tk.LEFT, padx=(6, 0))
-        self.lint_fix_btn = ttk.Button(
-            action_row, text="Fix lint", command=self.start_lint_check
-        )
-        self.lint_fix_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        # Secondary tasks live in one dropdown. Each entry's right-hand text says
+        # what it does, and hovering an entry shows more in the status line.
+        self.more_btn = ttk.Menubutton(action_row, text="More actions")
+        self.more_btn.pack(side=tk.LEFT, padx=(8, 0))
+        tip(self.more_btn, "Other PR tasks: dry run, explain, ask, triage comments, merge conflicts, lint.")
+        more_menu = tk.Menu(self.more_btn, tearoff=0)
+        self.more_btn["menu"] = more_menu
+        more_entries: list[MenuEntry] = []
+        self._menu_help: dict[str, str] = {}
+        actions = [
+            ("inspect_btn", "Inspect", self.start_inspect, "Dry run, no review",
+             "Shows the tier, model, effort, ticket, conventions, withheld files and estimated cost. Nothing is sent for review."),
+            ("explain_btn", "Explain PR", self.start_explain, "Plain-English walkthrough",
+             "Claude explains what the PR changes and why, without reviewing it."),
+            ("ask_btn", "Ask Claude", self.start_ask, "Ask using the Story box",
+             "Sends the Story / custom prompt text as a question about this PR."),
+            ("bot_check_btn", "Check review comments", self.start_bot_check, "Triage bot & reviewer comments",
+             "Finds CodeRabbit, Amazon Q and reviewer comments, checks each with Claude, and drafts fixes or replies for you to approve."),
+            ("merge_conflict_btn", "Resolve merge conflict", self.start_merge_conflict_check, "Draft conflict fixes",
+             "Runs a real three-way merge and has Claude draft resolutions for only the conflicting hunks."),
+            ("lint_fix_btn", "Fix lint", self.start_lint_check, "Fix style issues on changed lines",
+             "Scans the lines this PR touches for lint/style issues and drafts fixes to apply as one commit."),
+        ]
+        for index, (attr, label, command, short, long) in enumerate(actions):
+            more_menu.add_command(label=label, accelerator=short, command=command)
+            setattr(self, attr, MenuEntry(more_menu, index, self.more_btn, more_entries))
+            self._menu_help[label] = f"{label}: {long}"
+        more_menu.bind("<<MenuSelect>>", lambda _e, m=more_menu: self._show_menu_help(m))
+        more_menu.bind("<Unmap>", lambda _e: self._restore_status_after_menu(), add="+")
+
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(action_row, textvariable=self.status_var).pack(side=tk.LEFT, padx=12)
+        ttk.Label(action_row, textvariable=self.status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=12)
         self.thinking = ThinkingIndicator(action_row)
         # Hidden until a review starts.
-        self.copy_llm_btn = ttk.Button(
-            action_row,
-            text="Copy as LLM prompt",
-            command=self.copy_as_llm_prompt,
-            state=tk.DISABLED,
-        )
-        self.copy_llm_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.copy_all_btn = ttk.Button(
-            action_row, text="Copy all", command=self.copy_all, state=tk.DISABLED
-        )
-        self.copy_all_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.copy_selected_btn = ttk.Button(
-            action_row,
-            text="Copy selected",
-            command=self.copy_selected,
-            state=tk.DISABLED,
-        )
-        self.copy_selected_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
-        usage_row = ttk.Frame(tab)
-        usage_row.pack(fill=tk.X, pady=(0, 8))
-        self.usage_var = tk.StringVar(value="Tokens — last call: — · this run: — · session: —")
-        ttk.Label(
-            usage_row, textvariable=self.usage_var, foreground="#666"
-        ).pack(side=tk.LEFT)
+        self.copy_btn = ttk.Menubutton(action_row, text="Copy")
+        self.copy_btn.pack(side=tk.RIGHT)
+        tip(self.copy_btn, "Copy the output: the selection, everything, or a prompt to paste into another LLM.")
+        copy_menu = tk.Menu(self.copy_btn, tearoff=0)
+        self.copy_btn["menu"] = copy_menu
+        copy_entries: list[MenuEntry] = []
+        copies = [
+            ("copy_selected_btn", "Copy selected", self.copy_selected, "Highlighted text"),
+            ("copy_all_btn", "Copy all", self.copy_all, "Whole output"),
+            ("copy_llm_btn", "Copy as LLM prompt", self.copy_as_llm_prompt, "Findings as a fix-it prompt"),
+        ]
+        for index, (attr, label, command, short) in enumerate(copies):
+            copy_menu.add_command(label=label, accelerator=short, command=command)
+            entry = MenuEntry(copy_menu, index, self.copy_btn, copy_entries)
+            setattr(self, attr, entry)
+        for entry in copy_entries:
+            entry.configure(state=tk.DISABLED)
 
-        # Compact auth strip — lights + short labels; details on hover.
-        auth_row = ttk.Frame(tab)
-        auth_row.pack(fill=tk.X, pady=(0, 8))
+        self._build_status_bar()
 
-        ttk.Label(auth_row, text="Auth").pack(side=tk.LEFT)
-
-        gh_chip = ttk.Frame(auth_row)
-        gh_chip.pack(side=tk.LEFT, padx=(10, 0))
-        self.github_auth_light = StatusLight(gh_chip)
-        self.github_auth_light.pack(side=tk.LEFT)
-        self.github_auth_label_var = tk.StringVar(value="GitHub")
-        gh_btn = ttk.Button(
-            gh_chip, textvariable=self.github_auth_label_var, command=self.quick_github_login, width=10
-        )
-        gh_btn.pack(side=tk.LEFT, padx=(4, 0))
-        self.github_tooltip = Tooltip(gh_btn)
-        self.github_tooltip.set("Click to sign in with GitHub")
-
-        cl_chip = ttk.Frame(auth_row)
-        cl_chip.pack(side=tk.LEFT, padx=(8, 0))
-        self.claude_auth_light = StatusLight(cl_chip)
-        self.claude_auth_light.pack(side=tk.LEFT)
-        self.claude_auth_label_var = tk.StringVar(value="Claude")
-        cl_btn = ttk.Button(
-            cl_chip,
-            textvariable=self.claude_auth_label_var,
-            command=self.quick_claude_login,
-            width=10,
-        )
-        cl_btn.pack(side=tk.LEFT, padx=(4, 0))
-        self.claude_tooltip = Tooltip(cl_btn)
-        self.claude_tooltip.set("Click to sign in with Claude SSO")
-
-        ttk.Button(
-            auth_row, text="Refresh", command=self.refresh_auth_lights, width=8
-        ).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Button(
-            auth_row, text="Clear auth", command=self.clear_all_auths, width=10
-        ).pack(side=tk.LEFT, padx=(6, 0))
-
-        # Kept for compatibility with older restore/update helpers.
-        self.auth_status_var = tk.StringVar(value="")
-
-        output_box = ttk.LabelFrame(
-            tab,
-            text="Output",
-            padding=8,
-        )
+        output_box = Section(tab, "Output")
         output_box.pack(fill=tk.BOTH, expand=True)
         self.output_box = output_box
+        body = output_box.body
 
-        # Plain frame — title comes from output_box via _show_panel (avoid nested labels).
-        self.live_frame = ttk.Frame(output_box)
-        # Shown only while a review is running.
+        # Shown only while a review is running. No padding or border around it,
+        # so the dark console runs to the edges of the section.
+        self.live_frame = tk.Frame(body, background=TERMINAL_BG)
         self.live_text = scrolledtext.ScrolledText(
             self.live_frame,
             height=10,
             wrap=tk.WORD,
             font=("Consolas", 9),
-            background="#0d1117",
+            background=TERMINAL_BG,
             foreground="#c9d1d9",
             insertbackground="#c9d1d9",
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=0,
+            padx=12,
+            pady=10,
         )
+        self.live_text.frame.configure(background=TERMINAL_BG, borderwidth=0, highlightthickness=0)
         self.live_text.pack(fill=tk.BOTH, expand=True)
         self.live_text.tag_configure("status", foreground="#8b949e", font=("Consolas", 9, "italic"))
         self.live_text.tag_configure("thinking", foreground="#d2a8ff")
         self.live_text.tag_configure("text", foreground="#7ee787")
         self.live_text.configure(state=tk.DISABLED)
 
-        self.explain_frame = ttk.Frame(output_box)
+        self.explain_frame = ttk.Frame(body)
         self.explain_text = scrolledtext.ScrolledText(
             self.explain_frame,
             wrap=tk.WORD,
@@ -1824,10 +362,12 @@ class PeerReviewApp(tk.Tk):
             insertwidth=0,
             cursor="arrow",
         )
+        soften_text(self.explain_text)
+        self.explain_text.configure(padx=12, pady=10)
         self.explain_text.pack(fill=tk.BOTH, expand=True)
         enable_selection_copy(self.explain_text)
 
-        self.diff_view = DiffReviewView(output_box)
+        self.diff_view = DiffReviewView(body)
         self.diff_view.pack(fill=tk.BOTH, expand=True)
         self.diff_view.on_submit_review = self.open_submit_review
         # Keep a hidden plain buffer for fallback copy of raw review text.
@@ -1839,6 +379,85 @@ class PeerReviewApp(tk.Tk):
         self.pr_url_var.trace_add("write", lambda *_: self.on_pr_url_changed())
         self._restore_cached_auth_lights()
         self.after(200, self.refresh_auth_lights)
+
+    def _build_status_bar(self) -> None:
+        """Token usage on the left; auth status and app-level tools on the right."""
+        bar = self.status_bar
+        self.usage_var = tk.StringVar(value="Tokens — last call: — · this run: — · session: —")
+        usage = ttk.Label(bar, textvariable=self.usage_var, style="Muted.TLabel")
+        usage.pack(side=tk.LEFT)
+        tip(usage, "Input / output tokens for the most recent Claude call, the current run, and since the app opened.")
+
+        right = ttk.Frame(bar)
+        right.pack(side=tk.RIGHT)
+
+        def chip(label_var: tk.StringVar, command) -> tuple[StatusLight, Tooltip]:  # noqa: ANN001
+            light = StatusLight(right, size=14)
+            light.pack(side=tk.LEFT, padx=(10, 2))
+            link = LinkButton(right, command, textvariable=label_var)
+            link.pack(side=tk.LEFT)
+            return light, Tooltip(link)
+
+        self.github_auth_label_var = tk.StringVar(value="GitHub")
+        self.github_auth_light, self.github_tooltip = chip(self.github_auth_label_var, self.quick_github_login)
+        self.github_tooltip.set("Click to sign in with GitHub")
+        self.claude_auth_label_var = tk.StringVar(value="Claude")
+        self.claude_auth_light, self.claude_tooltip = chip(self.claude_auth_label_var, self.quick_claude_login)
+        self.claude_tooltip.set("Click to sign in with Claude SSO")
+
+        ttk.Separator(right, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
+        tip(
+            LinkButton(right, self.refresh_auth_lights, text="Refresh"),
+            "Re-check the GitHub and Claude sign-in status.",
+        ).pack(side=tk.LEFT)
+        self.doctor_btn = LinkButton(right, self.start_doctor, text="Doctor")
+        self.doctor_btn.pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            self.doctor_btn,
+            "Diagnose setup: Claude/gh/GitHub/Jira access, model ids, prompts and the repo's pr-review.yml.",
+        )
+        tip(
+            LinkButton(right, self.clear_all_auths, text="Clear auth"),
+            "Sign out of GitHub and Claude for this app (clears WSL/Windows GitHub credentials and the Claude SSO session).",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            LinkButton(right, self.open_settings, text="Settings"),
+            "Tokens, sign-in options, review defaults and Jira settings.",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        # Kept for compatibility with older restore/update helpers.
+        self.auth_status_var = tk.StringVar(value="")
+
+    def _update_advanced_summary(self) -> None:
+        """Show overrides next to the collapsed header so they aren't hidden."""
+        picks = [
+            ("model", self.model_choice_var),
+            ("effort", self.effort_var),
+            ("mode", self.mode_choice_var),
+            ("verify", self.verify_var),
+        ]
+        overrides = [f"{name}: {var.get()}" for name, var in picks if var.get() != "auto"]
+        self.advanced_options.summary_var.set(" · ".join(overrides) if overrides else "all auto")
+
+    def _show_menu_help(self, menu: tk.Menu) -> None:
+        try:
+            index = menu.index("active")
+        except tk.TclError:
+            index = None
+        if index is None:
+            self._restore_status_after_menu()
+            return
+        label = menu.entrycget(index, "label")
+        if label in self._menu_help:
+            if not hasattr(self, "_status_before_menu"):
+                self._status_before_menu = self.status_var.get()
+            self.status_var.set(self._menu_help[label])
+
+    def _restore_status_after_menu(self) -> None:
+        previous = getattr(self, "_status_before_menu", None)
+        if previous is not None and self.status_var.get() in self._menu_help.values():
+            self.status_var.set(previous)
+        self.__dict__.pop("_status_before_menu", None)
 
     def _restore_cached_auth_lights(self) -> None:
         cached = load_auth_status()
@@ -1861,307 +480,6 @@ class PeerReviewApp(tk.Tk):
             github_known=gh.get("ok") is not None,
             claude_known=cl.get("ok") is not None,
         )
-
-    def _build_prompts_tab(self) -> None:
-        tab = self.prompts_tab
-
-        toolbar = ttk.Frame(tab)
-        toolbar.pack(fill=tk.X)
-        ttk.Button(toolbar, text="New", command=self.new_prompt).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Edit", command=self.edit_prompt).pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="Delete", command=self.delete_selected_prompt).pack(
-            side=tk.LEFT, padx=4
-        )
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
-            side=tk.LEFT, fill=tk.Y, padx=8, pady=2
-        )
-        ttk.Button(toolbar, text="Move up", command=self.move_prompt_up).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Move down", command=self.move_prompt_down).pack(
-            side=tk.LEFT, padx=4
-        )
-        ttk.Button(toolbar, text="Reload", command=self.refresh_prompts_ui).pack(
-            side=tk.LEFT, padx=4
-        )
-
-        columns = ("name", "repo_type", "generic")
-        self.prompt_tree = ttk.Treeview(
-            tab, columns=columns, show="headings", selectmode="browse"
-        )
-        self.prompt_tree.heading("name", text="Name")
-        self.prompt_tree.heading("repo_type", text="Repo type")
-        self.prompt_tree.heading("generic", text="Generic")
-        self.prompt_tree.column("name", width=280)
-        self.prompt_tree.column("repo_type", width=180)
-        self.prompt_tree.column("generic", width=80, anchor="center")
-        self.prompt_tree.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        self.prompt_tree.bind("<Double-1>", lambda _e: self.edit_prompt())
-        self._drag_prompt_id: str | None = None
-        self._drag_target_id: str | None = None
-        self.prompt_tree.bind("<ButtonPress-1>", self._on_prompt_drag_start)
-        self.prompt_tree.bind("<B1-Motion>", self._on_prompt_drag_motion)
-        self.prompt_tree.bind("<ButtonRelease-1>", self._on_prompt_drag_drop)
-        # Visual cue while dragging over a row.
-        try:
-            self.prompt_tree.tag_configure("drop_target", background="#ddf4ff")
-        except tk.TclError:
-            pass
-
-        preview_frame = ttk.LabelFrame(tab, text="Selected prompt", padding=8)
-        preview_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        self.prompt_detail = scrolledtext.ScrolledText(
-            preview_frame, height=10, wrap=tk.WORD, state=tk.DISABLED
-        )
-        self.prompt_detail.pack(fill=tk.BOTH, expand=True)
-        self.prompt_tree.bind("<<TreeviewSelect>>", self.on_prompt_select)
-
-    def _build_history_tab(self) -> None:
-        tab = self.history_tab
-
-        toolbar = ttk.Frame(tab)
-        toolbar.pack(fill=tk.X)
-        ttk.Button(toolbar, text="Revisit", command=self.revisit_history_entry).pack(
-            side=tk.LEFT
-        )
-        ttk.Button(
-            toolbar, text="Restore inputs only", command=self.restore_history_inputs
-        ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="Delete", command=self.delete_selected_history).pack(
-            side=tk.LEFT, padx=4
-        )
-        ttk.Button(toolbar, text="Clear all", command=self.clear_all_history).pack(
-            side=tk.LEFT, padx=4
-        )
-        ttk.Button(toolbar, text="Refresh", command=self.refresh_history_ui).pack(
-            side=tk.RIGHT
-        )
-
-        paned = ttk.Panedwindow(tab, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-
-        left = ttk.Frame(paned)
-        right = ttk.Frame(paned)
-        paned.add(left, weight=1)
-        paned.add(right, weight=2)
-
-        list_box = ttk.LabelFrame(left, text="Past runs", padding=6)
-        list_box.pack(fill=tk.BOTH, expand=True)
-        self.history_list = tk.Listbox(list_box, exportselection=False, font=("Segoe UI", 9))
-        hist_scroll = ttk.Scrollbar(
-            list_box, orient=tk.VERTICAL, command=self.history_list.yview
-        )
-        self.history_list.configure(yscrollcommand=hist_scroll.set)
-        self.history_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        hist_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.history_list.bind("<<ListboxSelect>>", self.on_history_select)
-        self.history_list.bind("<Double-Button-1>", lambda _e: self.revisit_history_entry())
-        self._history_ids: list[str] = []
-
-        detail = ttk.LabelFrame(right, text="Details", padding=6)
-        detail.pack(fill=tk.BOTH, expand=True)
-        self.history_meta_var = tk.StringVar(value="Select a past run to inspect it.")
-        ttk.Label(detail, textvariable=self.history_meta_var, wraplength=520).pack(
-            anchor="w", pady=(0, 6)
-        )
-
-        self.history_notebook = ttk.Notebook(detail)
-        self.history_notebook.pack(fill=tk.BOTH, expand=True)
-
-        story_tab = ttk.Frame(self.history_notebook, padding=4)
-        prompt_tab = ttk.Frame(self.history_notebook, padding=4)
-        result_tab = ttk.Frame(self.history_notebook, padding=4)
-        self.history_notebook.add(story_tab, text="Story / custom prompt")
-        self.history_notebook.add(prompt_tab, text="Reviewer prompt")
-        self.history_notebook.add(result_tab, text="Result")
-
-        self.history_story = scrolledtext.ScrolledText(
-            story_tab, wrap=tk.WORD, state=tk.DISABLED, font=("Segoe UI", 10)
-        )
-        self.history_story.pack(fill=tk.BOTH, expand=True)
-        self.history_prompt = scrolledtext.ScrolledText(
-            prompt_tab, wrap=tk.WORD, state=tk.DISABLED, font=("Segoe UI", 10)
-        )
-        self.history_prompt.pack(fill=tk.BOTH, expand=True)
-        self.history_result = scrolledtext.ScrolledText(
-            result_tab, wrap=tk.WORD, state=tk.DISABLED, font=("Segoe UI", 10)
-        )
-        self.history_result.pack(fill=tk.BOTH, expand=True)
-
-    def _set_history_text(self, widget: scrolledtext.ScrolledText, text: str) -> None:
-        widget.configure(state=tk.NORMAL)
-        widget.delete("1.0", tk.END)
-        widget.insert("1.0", text or "")
-        widget.configure(state=tk.DISABLED)
-
-    def refresh_history_ui(self, *, select_id: str | None = None) -> None:
-        keep = select_id or self._selected_history_id()
-        self.history_list.delete(0, tk.END)
-        self._history_ids = []
-        for entry in list_history():
-            self._history_ids.append(entry.id)
-            self.history_list.insert(tk.END, entry.list_title())
-        if keep and keep in self._history_ids:
-            index = self._history_ids.index(keep)
-            self.history_list.selection_clear(0, tk.END)
-            self.history_list.selection_set(index)
-            self.history_list.see(index)
-            self.on_history_select()
-        elif not self._history_ids:
-            self.history_meta_var.set("No history yet. Run a review, explain, or Ask Claude.")
-            self._set_history_text(self.history_story, "")
-            self._set_history_text(self.history_prompt, "")
-            self._set_history_text(self.history_result, "")
-
-    def _selected_history_id(self) -> str | None:
-        selection = self.history_list.curselection()
-        if not selection:
-            return None
-        index = int(selection[0])
-        if index < 0 or index >= len(self._history_ids):
-            return None
-        return self._history_ids[index]
-
-    def _selected_history_entry(self) -> HistoryEntry | None:
-        entry_id = self._selected_history_id()
-        if not entry_id:
-            return None
-        return get_history_entry(entry_id)
-
-    def on_history_select(self, _event: object = None) -> None:
-        entry = self._selected_history_entry()
-        if not entry:
-            return
-        when = entry.created_at.replace("T", " ") if entry.created_at else "unknown"
-        bits = [
-            f"{entry.mode_label}",
-            when,
-            entry.pr_ref or entry.pr_url or "(no PR)",
-        ]
-        if entry.pr_title:
-            bits.append(entry.pr_title)
-        self.history_meta_var.set("  ·  ".join(bits))
-        self._set_history_text(self.history_story, entry.story or "(empty)")
-        if entry.mode == "review":
-            prompt_body = entry.reviewer_prompt_content or "(no reviewer prompt saved)"
-            if entry.reviewer_prompt_name:
-                prompt_body = f"Name: {entry.reviewer_prompt_name}\n\n{prompt_body}"
-        elif entry.mode == "explain":
-            prompt_body = (
-                "(Built-in Explain PR prompt)\n\n"
-                "Optional story / details are under the Story tab."
-            )
-        else:
-            prompt_body = (
-                "(Ask Claude — no reviewer prompt)\n\n"
-                "The Story tab is the full custom prompt that was sent."
-            )
-        self._set_history_text(self.history_prompt, prompt_body)
-        self._set_history_text(self.history_result, entry.result or "(empty result)")
-        self.history_notebook.select(2)
-
-    def restore_history_inputs(self) -> None:
-        entry = self._selected_history_entry()
-        if not entry:
-            messagebox.showinfo("History", "Select a past run first.")
-            return
-        self._apply_history_inputs(entry)
-        if self.notebook is not None:
-            self.notebook.select(self.review_tab)
-        self.status_var.set(f"Restored inputs from {entry.mode_label}")
-
-    def revisit_history_entry(self) -> None:
-        entry = self._selected_history_entry()
-        if not entry:
-            messagebox.showinfo("History", "Select a past run first.")
-            return
-        self._apply_history_inputs(entry)
-        summary = list(entry.summary_lines) or [
-            f"Revisited {entry.mode_label}",
-            entry.pr_ref or entry.pr_url,
-            entry.created_at.replace("T", " ") if entry.created_at else "",
-        ]
-        if entry.mode == "review":
-            # Historical reviews keep the saved comment text; live diff panels need a fresh run.
-            self.diff_view.clear()
-            self._last_review_raw = format_copy_friendly(entry.result)
-            self._last_explanation = entry.result
-            self.explain_text.configure(state=tk.NORMAL)
-            self.explain_text.delete("1.0", tk.END)
-            header = "\n".join(s for s in summary if s) + "\n" + ("=" * 60) + "\n\n"
-            note = (
-                "(Historical peer review — comment text restored. "
-                "Run peer review again to rebuild inline diff panels.)\n\n"
-            )
-            self.explain_text.insert("1.0", header + note + (entry.result or ""))
-            enable_selection_copy(self.explain_text)
-            self._show_panel("explain")
-            self.output_box.configure(text="Historical peer review")
-            has_text = bool((entry.result or "").strip())
-            self.copy_all_btn.configure(state=tk.NORMAL if has_text else tk.DISABLED)
-            self.copy_selected_btn.configure(state=tk.NORMAL if has_text else tk.DISABLED)
-            self.copy_llm_btn.configure(state=tk.DISABLED)
-        else:
-            title = "PR explanation" if entry.mode == "explain" else "Claude response"
-            self._explain_success(
-                entry.result,
-                [s for s in summary if s],
-                title=title,
-                done_status=f"Revisited — {entry.mode_label}",
-                mode=entry.mode,
-                save_history=False,
-            )
-        if self.notebook is not None:
-            self.notebook.select(self.review_tab)
-        self.status_var.set(f"Revisited {entry.mode_label}")
-
-    def _apply_history_inputs(self, entry: HistoryEntry) -> None:
-        self.pr_url_var.set(entry.pr_url or "")
-        self.story_text.delete("1.0", tk.END)
-        if entry.story:
-            self.story_text.insert("1.0", entry.story)
-        if entry.mode == "review" and entry.reviewer_prompt_id:
-            try:
-                ref = parse_pr_url(entry.pr_url) if entry.pr_url else None
-                if ref is not None:
-                    self.cycler.repo_name = ref.repo
-                self.cycler.refresh()
-                if not self.cycler.set_by_id(entry.reviewer_prompt_id):
-                    # Fall back to name match if the original id was deleted/recreated.
-                    for prompt in self.cycler.prompts:
-                        if (
-                            entry.reviewer_prompt_name
-                            and prompt.name == entry.reviewer_prompt_name
-                        ):
-                            self.cycler.set_by_id(prompt.id)
-                            break
-            except Exception:  # noqa: BLE001
-                pass
-        self._update_prompt_cycle_view()
-        self.on_pr_url_changed()
-
-    def delete_selected_history(self) -> None:
-        entry = self._selected_history_entry()
-        if not entry:
-            messagebox.showinfo("History", "Select a past run first.")
-            return
-        if not messagebox.askyesno(
-            "Delete history",
-            f"Delete this {entry.mode_label} from history?",
-        ):
-            return
-        delete_history_entry(entry.id)
-        self.refresh_history_ui()
-
-    def clear_all_history(self) -> None:
-        if not list_history():
-            messagebox.showinfo("History", "History is already empty.")
-            return
-        if not messagebox.askyesno(
-            "Clear history",
-            "Delete all past runs from history?\n\nThis cannot be undone.",
-        ):
-            return
-        clear_history()
-        self.refresh_history_ui()
 
     def open_settings(self) -> None:
         SettingsDialog(self)
@@ -2373,8 +691,40 @@ class PeerReviewApp(tk.Tk):
             except Exception as exc:  # noqa: BLE001
                 message = str(exc)
                 self.after(0, lambda m=message: self._detect_repo_failure(m))
+                return
+            self._prefill_story_from_jira(url, token, config)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _prefill_story_from_jira(self, url: str, token: str, config: dict) -> None:
+        """Worker thread: put the referenced tickets' summary and acceptance
+        criteria in an empty Story box. It stays editable; the review also
+        gets the full tickets in their own section."""
+        from app.jira import fetch_pr_tickets
+
+        try:
+            diff = fetch_pull_request(url, token=token)
+            tickets, _keys, _note = fetch_pr_tickets(
+                config, title=diff.title, body=diff.body, head_branch=diff.head_branch
+            )
+        except Exception:  # noqa: BLE001 -- prefill is a convenience
+            return
+        if not tickets:
+            return
+        blocks = []
+        for t in tickets:
+            block = f"{t.key}: {t.summary}"
+            if t.acceptance_criteria:
+                block += f"\nAcceptance criteria:\n{t.acceptance_criteria.strip()}"
+            blocks.append(block)
+        text = "\n\n".join(blocks)
+
+        def apply() -> None:
+            if not self.story_text.get("1.0", "end-1c").strip():
+                self.story_text.insert("1.0", text)
+                self.status_var.set(f"Repo reachable; Story pre-filled from {', '.join(t.key for t in tickets)}")
+
+        self.after(0, apply)
 
     def _detect_repo_success(self, full_name: str, title: str) -> None:
         self.repo_label_var.set(full_name)
@@ -2426,111 +776,6 @@ class PeerReviewApp(tk.Tk):
             )
         self.prompt_preview.configure(state=tk.DISABLED)
 
-    def _reload_prompt_tree(self, *, select_id: str | None = None) -> None:
-        current = select_id or self._selected_prompt_id()
-        for item in self.prompt_tree.get_children():
-            self.prompt_tree.delete(item)
-        for prompt in list_prompts():
-            self.prompt_tree.insert(
-                "",
-                tk.END,
-                iid=prompt.id,
-                values=(
-                    prompt.name,
-                    prompt.repo_type,
-                    "yes" if prompt.is_generic else "no",
-                ),
-            )
-        if current and self.prompt_tree.exists(current):
-            self.prompt_tree.selection_set(current)
-            self.prompt_tree.see(current)
-            self.on_prompt_select()
-
-    def move_prompt_up(self) -> None:
-        self._move_selected_prompt(-1)
-
-    def move_prompt_down(self) -> None:
-        self._move_selected_prompt(1)
-
-    def _move_selected_prompt(self, direction: int) -> None:
-        prompt_id = self._selected_prompt_id()
-        if not prompt_id:
-            messagebox.showinfo("Reorder prompts", "Select a prompt first.")
-            return
-        try:
-            move_prompt(prompt_id, direction)
-        except KeyError as exc:
-            messagebox.showerror("Reorder failed", str(exc))
-            self.refresh_prompts_ui()
-            return
-        self.cycler.refresh()
-        self._update_prompt_cycle_view()
-        self._reload_prompt_tree(select_id=prompt_id)
-
-    def _clear_prompt_drop_highlight(self) -> None:
-        if self._drag_target_id and self.prompt_tree.exists(self._drag_target_id):
-            self.prompt_tree.item(self._drag_target_id, tags=())
-        self._drag_target_id = None
-
-    def _on_prompt_drag_start(self, event: tk.Event) -> None:
-        row = self.prompt_tree.identify_row(event.y)
-        if not row:
-            self._drag_prompt_id = None
-            return
-        self._drag_prompt_id = row
-        self.prompt_tree.selection_set(row)
-        self.prompt_tree.focus(row)
-        self.on_prompt_select()
-
-    def _on_prompt_drag_motion(self, event: tk.Event) -> None:
-        if not self._drag_prompt_id:
-            return
-        row = self.prompt_tree.identify_row(event.y)
-        if row == self._drag_target_id:
-            return
-        self._clear_prompt_drop_highlight()
-        if row and row != self._drag_prompt_id and self.prompt_tree.exists(row):
-            self._drag_target_id = row
-            self.prompt_tree.item(row, tags=("drop_target",))
-            self.prompt_tree.see(row)
-
-    def _on_prompt_drag_drop(self, event: tk.Event) -> None:
-        source_id = self._drag_prompt_id
-        self._clear_prompt_drop_highlight()
-        self._drag_prompt_id = None
-        if not source_id:
-            return
-        target_id = self.prompt_tree.identify_row(event.y)
-        if not target_id or target_id == source_id:
-            return
-        children = list(self.prompt_tree.get_children())
-        try:
-            new_index = children.index(target_id)
-        except ValueError:
-            return
-        # If dropping below the midpoint of the target row, place after it.
-        bbox = self.prompt_tree.bbox(target_id)
-        if bbox:
-            _x, y, _w, h = bbox
-            if event.y > y + (h / 2):
-                new_index += 1
-                # Account for removing source first when source is above target.
-        try:
-            source_index = children.index(source_id)
-        except ValueError:
-            return
-        if source_index < new_index:
-            new_index -= 1
-        try:
-            move_prompt_to_index(source_id, new_index)
-        except KeyError as exc:
-            messagebox.showerror("Reorder failed", str(exc))
-            self.refresh_prompts_ui()
-            return
-        self.cycler.refresh()
-        self._update_prompt_cycle_view()
-        self._reload_prompt_tree(select_id=source_id)
-
     def cycle_next(self) -> None:
         self.cycler.next()
         self._update_prompt_cycle_view()
@@ -2539,58 +784,188 @@ class PeerReviewApp(tk.Tk):
         self.cycler.prev()
         self._update_prompt_cycle_view()
 
-    def new_prompt(self) -> None:
-        dialog = PromptEditorDialog(self)
-        self.wait_window(dialog)
-        if dialog.result:
-            self.refresh_prompts_ui()
+    def start_review(self) -> None:
+        self._start_review_job(inspect_only=False)
 
-    def _selected_prompt_id(self) -> str | None:
-        selection = self.prompt_tree.selection()
-        return selection[0] if selection else None
+    def start_inspect(self) -> None:
+        self._start_review_job(inspect_only=True)
 
-    def edit_prompt(self) -> None:
-        prompt_id = self._selected_prompt_id()
-        if not prompt_id:
-            messagebox.showinfo("Edit prompt", "Select a prompt first.")
-            return
-        prompts = {p.id: p for p in list_prompts()}
-        prompt = prompts.get(prompt_id)
-        if not prompt:
-            messagebox.showerror("Edit prompt", "Prompt no longer exists.")
-            self.refresh_prompts_ui()
-            return
-        dialog = PromptEditorDialog(self, prompt)
-        self.wait_window(dialog)
-        if dialog.result:
-            self.refresh_prompts_ui()
+    def _review_options(self) -> ReviewOptions:
+        def pick(var: tk.StringVar) -> str | None:
+            value = var.get().strip()
+            return None if value in ("", "auto") else value
 
-    def delete_selected_prompt(self) -> None:
-        prompt_id = self._selected_prompt_id()
-        if not prompt_id:
-            messagebox.showinfo("Delete prompt", "Select a prompt first.")
+        verify = pick(self.verify_var)
+        return ReviewOptions(
+            model=pick(self.model_choice_var),
+            effort=pick(self.effort_var),
+            mode=pick(self.mode_choice_var),
+            verify=None if verify is None else verify == "on",
+            follow_up=bool(self.follow_up_var.get()),
+        )
+
+    def _claude_event_handler(self):
+        def on_claude_event(event: dict) -> None:
+            kind = str(event.get("kind") or "")
+            if kind == "usage":
+                self.after(0, lambda e=dict(event): self._record_usage(e))
+                return
+            text = str(event.get("text") or "")
+            self.after(0, lambda k=kind, t=text: self._append_live_claude(k, t))
+
+        return on_claude_event
+
+    def _start_review_job(self, *, inspect_only: bool) -> None:
+        if self._busy:
             return
-        if not messagebox.askyesno("Delete prompt", "Delete the selected prompt?"):
+        url = self.pr_url_var.get().strip()
+        if not url:
+            messagebox.showerror("Missing PR", "Paste a GitHub PR URL.")
             return
         try:
-            delete_prompt(prompt_id)
-        except KeyError as exc:
-            messagebox.showerror("Delete failed", str(exc))
-        self.refresh_prompts_ui()
+            parse_pr_url(url)
+        except ValueError as exc:
+            messagebox.showerror("Invalid URL", str(exc))
+            return
+        story = self.story_text.get("1.0", "end-1c")
+        prompt = self.cycler.current
+        config = load_config()
+        options = self._review_options()
+        history = list_reviews_for_pr(url)
+        if not inspect_only:
+            self._pending_history = {
+                "mode": "review",
+                "pr_url": url,
+                "story": story,
+                "reviewer_prompt_id": prompt.id if prompt else "",
+                "reviewer_prompt_name": prompt.name if prompt else "",
+                "reviewer_prompt_content": prompt.content if prompt else "",
+            }
+        self._busy = True
+        self._set_run_buttons_enabled(False)
+        self.status_var.set("Inspecting" if inspect_only else "Gathering review context")
+        self.thinking.start("Gathering context")
+        self.diff_view.clear()
+        self._last_review_raw = ""
+        self._last_explanation = ""
+        self._set_copy_buttons_enabled(False)
+        self._show_panel("live")
+        self._clear_live_claude()
+        self._reset_job_usage()
+        on_event = self._claude_event_handler()
 
-    def on_prompt_select(self, _event: object = None) -> None:
-        prompt_id = self._selected_prompt_id()
-        self.prompt_detail.configure(state=tk.NORMAL)
-        self.prompt_detail.delete("1.0", tk.END)
-        if prompt_id:
-            prompts = {p.id: p for p in list_prompts()}
-            prompt = prompts.get(prompt_id)
-            if prompt:
-                self.prompt_detail.insert("1.0", prompt.content)
-        self.prompt_detail.configure(state=tk.DISABLED)
+        def worker() -> None:
+            try:
+                prep = prepare_review(
+                    pr_url=url, story=story, reviewer_prompt=prompt, config=config, options=options,
+                    history_entries=history, on_event=on_event,
+                )
+                refine_estimate(prep, config)
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.after(0, lambda e=err: self._review_failure(e))
+                return
+            self.after(0, lambda: self._review_prepared(prep, config, inspect_only))
 
-    def start_review(self) -> None:
-        self._start_claude_job(mode="review")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _estimate_text(self, prep: ReviewPrep) -> str:
+        tokens = f"{prep.est_tokens:,} input tokens{'' if prep.counted else ' (estimated)'}"
+        if prep.est_cost is None:
+            return f"unpriced model, {tokens}"
+        return f"≈ ${prep.est_cost:.2f} ({tokens}, {prep.settings.model}, effort {prep.settings.effort})"
+
+    def _review_prepared(self, prep: ReviewPrep, config: dict, inspect_only: bool) -> None:
+        if inspect_only:
+            self.thinking.stop()
+            self._busy = False
+            self._set_run_buttons_enabled(True)
+            self._explain_success(
+                inspect_report(prep), [f"Inspect: {prep.diff.ref.full_name}#{prep.diff.ref.number}"],
+                title="Inspect (no review run)", done_status="Inspect ready: nothing was sent to Claude",
+                save_history=False,
+            )
+            return
+        while True:
+            try:
+                limit = float(config.get("warn_review_usd") or 0)
+            except (TypeError, ValueError):
+                limit = 0.0
+            over = bool(limit and prep.est_cost is not None and prep.est_cost > limit)
+            self._append_live_claude("status", f"estimate {self._estimate_text(prep)}")
+            if not prep.warnings and not over:
+                break
+            gate = RunGateDialog(
+                self, warnings=prep.warnings, estimate=self._estimate_text(prep), over_budget=over,
+                steps=budget_fit_steps(verification=prep.settings.verify, agentic=prep.agentic,
+                                       effort=prep.settings.effort),
+            )
+            self.wait_window(gate)
+            if gate.choice == "run":
+                break
+            if not isinstance(gate.choice, dict):
+                self.thinking.stop()
+                self._pending_history = None
+                self._busy = False
+                self._set_run_buttons_enabled(True)
+                self._show_panel("diff")
+                self.status_var.set("Review cancelled before anything was sent")
+                return
+            changes = gate.choice
+            if "verify" in changes:
+                prep.settings.verify = bool(changes["verify"])
+            if "agentic" in changes:
+                prep.settings.mode = "single-shot"
+            if "effort" in changes:
+                prep.settings.effort = str(changes["effort"])
+            prep.warnings = []  # already acknowledged
+            prep.build_parts()
+        self.status_var.set("Review in progress")
+        self.thinking.start("Asking Claude")
+        on_event = self._claude_event_handler()
+
+        def worker() -> None:
+            try:
+                run = execute_review(prep, config, on_event)
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                partial = getattr(exc, "partial", "")
+                self.after(0, lambda e=err, p=partial: self._review_failure(e + (f"\n\nPartial output:\n{p}" if p else "")))
+                return
+            self.after(0, lambda: self._review_success(run))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def start_doctor(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self._set_run_buttons_enabled(False)
+        self.status_var.set("Running Doctor checks")
+        self.thinking.start("Checking")
+        self._clear_live_claude()
+        self._show_panel("live")
+        config = load_config()
+        url = self.pr_url_var.get().strip()
+
+        def on_check(check) -> None:  # noqa: ANN001
+            line = format_report([check])
+            self.after(0, lambda t=line: self._append_live_claude("text", t + "\n"))
+
+        def worker() -> None:
+            try:
+                report = format_report(run_doctor(config, url, on_check=on_check))
+            except Exception as exc:  # noqa: BLE001
+                report = f"Doctor failed: {exc}"
+            self.after(0, lambda: self._doctor_done(report))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _doctor_done(self, report: str) -> None:
+        self.thinking.stop()
+        self._busy = False
+        self._set_run_buttons_enabled(True)
+        self._explain_success(report, ["Doctor"], title="Doctor", done_status="Doctor finished", save_history=False)
 
     def _refresh_follow_up_info(self) -> None:
         url = self.pr_url_var.get().strip()
@@ -2683,6 +1058,8 @@ class PeerReviewApp(tk.Tk):
     def _set_run_buttons_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
         self.run_btn.configure(state=state)
+        self.inspect_btn.configure(state=state)
+        self.doctor_btn.configure(state=state)
         self.explain_btn.configure(state=state)
         self.ask_btn.configure(state=state)
         self.bot_check_btn.configure(state=state)
@@ -2896,9 +1273,6 @@ class PeerReviewApp(tk.Tk):
 
         prompt = self.cycler.current
         config = load_config()
-        prior_reviews: list[str] = []
-        if mode == "review" and self.follow_up_var.get():
-            prior_reviews = [e.result for e in list_reviews_for_pr(url)]
         self._pending_history = {
             "mode": mode,
             "pr_url": url,
@@ -2990,32 +1364,7 @@ class PeerReviewApp(tk.Tk):
                         ),
                     )
                 else:
-                    diff, review = run_peer_review(
-                        pr_url=url,
-                        story=story,
-                        reviewer_prompt=prompt,
-                        config=config,
-                        on_claude_event=on_claude_event,
-                        prior_reviews=prior_reviews,
-                    )
-                    auth_source = getattr(diff, "auth_source", "unknown")
-                    summary = [
-                        f"Reviewed: {diff.ref.full_name}#{diff.ref.number} — {diff.title}",
-                        f"Files changed: {len(diff.files)}",
-                        f"Auth: {auth_source}",
-                        f"Prompt: {prompt.name if prompt else '(none)'}",
-                        (
-                            f"Pass: follow-up ({len(prior_reviews)} previous, new blocker/major only)"
-                            if prior_reviews
-                            else "Pass: full review"
-                        ),
-                    ]
-                    self.after(
-                        0,
-                        lambda d=diff, r=review, s=list(summary): self._review_success(
-                            d, r, s
-                        ),
-                    )
+                    raise ValueError(f"Unknown job mode {mode!r}; peer reviews go through start_review.")
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
                 self.after(0, lambda e=err: self._review_failure(e))
@@ -3072,19 +1421,44 @@ class PeerReviewApp(tk.Tk):
             output_tokens = int(event.get("output_tokens") or 0)
         except (TypeError, ValueError):
             return
+        try:
+            cache_read = int(event.get("cache_read_tokens") or 0)
+            cost = float(event["cost_usd"]) if event.get("cost_usd") else 0.0
+        except (TypeError, ValueError):
+            cache_read, cost = 0, 0.0
         self._call_usage = (input_tokens, output_tokens)
         self._job_usage["input"] += input_tokens
         self._job_usage["output"] += output_tokens
+        self._job_usage["cache_read"] = self._job_usage.get("cache_read", 0) + cache_read
+        self._job_usage["usd"] = self._job_usage.get("usd", 0.0) + cost
         self._session_usage["input"] += input_tokens
         self._session_usage["output"] += output_tokens
+        self._session_usage["usd"] = self._session_usage.get("usd", 0.0) + cost
         self._update_usage_label()
 
     def _update_usage_label(self) -> None:
         call_in, call_out = self._call_usage
+        run_usd = self._job_usage.get("usd", 0.0)
+        session_usd = self._session_usage.get("usd", 0.0)
         self.usage_var.set(
             f"Tokens — last call: {call_in:,} in / {call_out:,} out   ·   "
-            f"this run: {self._job_usage['input']:,} in / {self._job_usage['output']:,} out   ·   "
-            f"session: {self._session_usage['input']:,} in / {self._session_usage['output']:,} out"
+            f"this run: {self._job_usage['input']:,} in / {self._job_usage['output']:,} out"
+            + (f" (${run_usd:.3f})" if run_usd else "")
+            + f"   ·   session: {self._session_usage['input']:,} in / {self._session_usage['output']:,} out"
+            + (f" (${session_usd:.3f})" if session_usd else "")
+        )
+
+    def _usage_footer(self, run: ReviewRun) -> str:
+        """Footer for the posted summary: model, effort, mode, tokens, cache %, cost."""
+        prep = run.prep
+        total_in = self._job_usage["input"] + self._job_usage.get("cache_read", 0)
+        cache_pct = round(100 * self._job_usage.get("cache_read", 0) / total_in) if total_in else 0
+        usd = self._job_usage.get("usd", 0.0) or (run.cost_usd or 0.0)
+        return (
+            f"Peer Review App · tier `{prep.settings.tier}` · {prep.settings.model} · effort {prep.settings.effort} · "
+            f"{'agentic' if prep.agentic else 'single-shot'}{' + verification' if prep.settings.verify else ''} · "
+            f"{self._job_usage['input']:,} in / {self._job_usage['output']:,} out · {cache_pct}% from cache"
+            + (f" · ${usd:.3f}" if usd else "")
         )
 
     def _append_live_claude(self, kind: str, text: str) -> None:
@@ -3112,6 +1486,9 @@ class PeerReviewApp(tk.Tk):
         pr_title: str = "",
         pr_ref: str = "",
         mode: str | None = None,
+        head_sha: str = "",
+        base_sha: str = "",
+        review: dict | None = None,
     ) -> None:
         pending = self._pending_history
         self._pending_history = None
@@ -3134,6 +1511,9 @@ class PeerReviewApp(tk.Tk):
                     pending.get("reviewer_prompt_content") or ""
                 ),
                 summary_lines=summary_lines or [],
+                head_sha=head_sha,
+                base_sha=base_sha,
+                review=review,
             )
             self.refresh_history_ui()
             self._refresh_follow_up_info()
@@ -3158,27 +1538,33 @@ class PeerReviewApp(tk.Tk):
             pr_ref = head
         return pr_ref.strip(), pr_title.strip()
 
-    def _review_success(self, diff, review: str, summary: list[str]) -> None:
+    def _review_success(self, run: ReviewRun) -> None:
         self.thinking.stop()
         try:
-            text = (review or "").strip() or self._live_streamed_answer()
-            self._last_review_raw = format_copy_friendly(text)
+            self._last_run = run
+            diff, result = run.prep.diff, run.result
+            summary = review_summary_lines(run)
+            readable = "\n".join(
+                [f"{result.headline()}: {result.verdict_reason}".strip(": "), result.scope_note, result.tests_note, ""]
+            ).strip() + "\n\n" + comments_to_copy_text(result.findings)
+            self._last_review_raw = format_copy_friendly(comments_to_copy_text(result.findings) or run.raw_text)
             self._last_explanation = ""
-            self.diff_view.render(
-                diff=diff,
-                review_text=text,
-                summary_lines=summary,
-            )
+            self.diff_view.render_result(diff=diff, result=result, summary_lines=summary)
             self._show_panel("diff")
-            self.status_var.set("Done — comments shown under matching lines")
+            count = len(result.findings)
+            self.status_var.set(
+                f"Done: {result.headline()}, {count} finding(s)" + (" under matching lines" if count else "")
+            )
             self._set_copy_buttons_enabled(self.diff_view.has_review_content())
-            pr_ref = f"{diff.ref.full_name}#{diff.ref.number}"
             self._record_history(
-                result=text,
+                result=readable.strip() or run.raw_text,
                 summary_lines=summary,
                 pr_title=diff.title,
-                pr_ref=pr_ref,
+                pr_ref=f"{diff.ref.full_name}#{diff.ref.number}",
                 mode="review",
+                head_sha=diff.head_sha,
+                base_sha=diff.base_sha,
+                review=review_to_history(run),
             )
         except Exception as exc:  # noqa: BLE001
             self._pending_history = None
@@ -3268,8 +1654,9 @@ class PeerReviewApp(tk.Tk):
     def open_submit_review(self) -> None:
         diff = self.diff_view.get_diff()
         comments = self.diff_view.get_comments()
-        if diff is None or not comments:
-            messagebox.showinfo("Submit to GitHub", "Run a peer review with comments first.")
+        run = getattr(self, "_last_run", None)
+        if diff is None or run is None or run.prep.diff is not diff:
+            messagebox.showinfo("Submit to GitHub", "Run a peer review first.")
             return
         config = load_config()
         try:
@@ -3286,7 +1673,7 @@ class PeerReviewApp(tk.Tk):
                 "Missing the PR's head commit SHA — re-run the peer review and try again.",
             )
             return
-        SubmitReviewDialog(self, diff=diff, comments=list(comments), token=token)
+        SubmitReviewDialog(self, run=run, findings=list(comments), token=token, footer=self._usage_footer(run))
 
     def copy_as_llm_prompt(self) -> None:
         if self._output_mode == "explain":

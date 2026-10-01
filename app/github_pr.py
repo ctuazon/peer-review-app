@@ -52,6 +52,16 @@ class PullRequestDiff:
     files: list[dict[str, Any]] = field(default_factory=list)
     patch_text: str = ""
     changed_lines: list[ChangedLine] = field(default_factory=list)
+    base_sha: str = ""
+    draft: bool = False
+    state: str = "open"
+    merged: bool = False
+    additions: int = 0
+    deletions: int = 0
+
+    @property
+    def paths(self) -> list[str]:
+        return [f.get("filename") for f in self.files if f.get("filename")]
 
 
 def parse_pr_url(url: str) -> PullRequestRef:
@@ -208,6 +218,12 @@ def fetch_pull_request(url: str, token: str = "") -> PullRequestDiff:
         files=files,
         patch_text="\n".join(patch_chunks),
         changed_lines=changed_lines,
+        base_sha=(pr.get("base") or {}).get("sha") or "",
+        draft=bool(pr.get("draft")),
+        state=pr.get("state") or "open",
+        merged=bool(pr.get("merged") or pr.get("merged_at")),
+        additions=int(pr.get("additions") or 0),
+        deletions=int(pr.get("deletions") or 0),
     )
 
 
@@ -224,13 +240,17 @@ def summarize_diff_for_prompt(diff: PullRequestDiff, max_chars: int = 120_000) -
         f"Branches: {diff.head_branch} -> {diff.base_branch}\n"
         f"Description:\n{diff.body or '(none)'}\n\n"
         f"Changed files:\n{file_list or '(none)'}\n\n"
-        f"Unified diff:\n"
+        f"Diff (line-numbered: R = new side, L = old side):\n"
     )
-    remaining = max_chars - len(header)
-    patch = diff.patch_text
-    if remaining > 0 and len(patch) > remaining:
-        patch = patch[:remaining] + "\n\n[diff truncated due to size]"
-    return header + patch
+    # Hand-written source first, whole files only; lockfiles/vendor and
+    # secret-bearing files are listed as withheld rather than sent.
+    from app.diff_model import build_file_diffs
+    from app.diff_select import render_selected, select_diffs
+    from app.secrets_scan import mask_diffs, mask_text
+
+    diffs = mask_diffs(build_file_diffs(diff.files))
+    selection = select_diffs(diffs, max_chars=max(10_000, max_chars - len(header)))
+    return mask_text(header) + render_selected(diffs, selection)
 
 
 def _paginated_get(url: str, headers: dict[str, str], timeout: int = 60) -> list[dict[str, Any]]:
@@ -461,3 +481,199 @@ def reply_to_review_comment(
     )
     resp.raise_for_status()
     return resp.json()
+
+
+# --- review context and publishing endpoints -------------------------------
+
+def _api(ref: PullRequestRef) -> str:
+    return f"https://api.github.com/repos/{ref.owner}/{ref.repo}"
+
+
+def get_tree_paths(ref: PullRequestRef, sha: str, token: str = "") -> list[str]:
+    """Every blob path at `sha` (recursive tree). Empty when GitHub truncates or fails."""
+    resp = requests.get(
+        f"{_api(ref)}/git/trees/{sha}", headers=_headers(token), params={"recursive": "1"}, timeout=60
+    )
+    if not resp.ok:
+        return []
+    return [item["path"] for item in (resp.json() or {}).get("tree") or [] if item.get("type") == "blob"]
+
+
+def get_file_text(ref: PullRequestRef, path: str, at: str, token: str = "") -> str | None:
+    """Text of `path` at a branch or sha, or None when missing/unreadable."""
+    try:
+        text, _sha = get_file_content(ref, path, at, token=token)
+    except (FileNotFoundError, ValueError, requests.RequestException):
+        return None
+    return text
+
+
+def fetch_check_runs(ref: PullRequestRef, sha: str, token: str = "") -> list[dict[str, Any]]:
+    resp = requests.get(
+        f"{_api(ref)}/commits/{sha}/check-runs",
+        headers=_headers(token),
+        params={"per_page": 100},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return (resp.json() or {}).get("check_runs") or []
+
+
+def fetch_pr_commits(ref: PullRequestRef, token: str = "") -> list[dict[str, Any]]:
+    return _paginated_get(f"{_api(ref)}/pulls/{ref.number}/commits", _headers(token))
+
+
+def fetch_path_commits(
+    ref: PullRequestRef, path: str, sha: str, token: str = "", per_page: int = 5
+) -> list[dict[str, Any]]:
+    resp = requests.get(
+        f"{_api(ref)}/commits",
+        headers=_headers(token),
+        params={"path": path, "sha": sha, "per_page": per_page},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json() or []
+
+
+def fetch_compare(ref: PullRequestRef, base: str, head: str, token: str = "") -> dict[str, Any] | None:
+    """`compare/base...head`, or None when `base` no longer exists (force-push)."""
+    resp = requests.get(f"{_api(ref)}/compare/{base}...{head}", headers=_headers(token), timeout=60)
+    if resp.status_code in (404, 422):
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_dependabot_alerts(ref: PullRequestRef, token: str = "") -> list[dict[str, Any]] | None:
+    """Open Dependabot alerts, or None when the token can't read them."""
+    resp = requests.get(
+        f"{_api(ref)}/dependabot/alerts",
+        headers=_headers(token),
+        params={"state": "open", "per_page": 100},
+        timeout=30,
+    )
+    if not resp.ok:
+        return None
+    return resp.json() or []
+
+
+def create_pr_review(
+    ref: PullRequestRef,
+    *,
+    commit_id: str,
+    body: str,
+    event: str = "COMMENT",
+    comments: list[dict[str, Any]] | None = None,
+    token: str = "",
+) -> dict[str, Any]:
+    """One review object: summary body + optional inline comments in a single call."""
+    payload: dict[str, Any] = {"commit_id": commit_id, "body": body, "event": event}
+    if comments:
+        payload["comments"] = comments
+    resp = requests.post(
+        f"{_api(ref)}/pulls/{ref.number}/reviews", headers=_headers(token), json=payload, timeout=60
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def update_pr_review(ref: PullRequestRef, review_id: int, body: str, token: str = "") -> dict[str, Any]:
+    resp = requests.put(
+        f"{_api(ref)}/pulls/{ref.number}/reviews/{review_id}",
+        headers=_headers(token),
+        json={"body": body},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def create_line_comment(
+    ref: PullRequestRef, payload: dict[str, Any], token: str = ""
+) -> dict[str, Any]:
+    """Standalone inline comment from a review-comment payload (path/line/side/body, start_*)."""
+    resp = requests.post(
+        f"{_api(ref)}/pulls/{ref.number}/comments", headers=_headers(token), json=payload, timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def delete_review_comment(ref: PullRequestRef, comment_id: int, token: str = "") -> None:
+    resp = requests.delete(f"{_api(ref)}/pulls/comments/{comment_id}", headers=_headers(token), timeout=30)
+    if resp.status_code != 404:
+        resp.raise_for_status()
+
+
+def graphql(query: str, variables: dict[str, Any], token: str = "") -> dict[str, Any]:
+    resp = requests.post(
+        "https://api.github.com/graphql",
+        headers=_headers(token),
+        json={"query": query, "variables": variables},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    payload = resp.json() or {}
+    if payload.get("errors"):
+        raise RuntimeError("; ".join(str(e.get("message")) for e in payload["errors"]))
+    return payload.get("data") or {}
+
+
+_THREADS_QUERY = """
+query ($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id isResolved path line originalLine
+          comments(first: 1) { nodes { databaseId body url author { login } } }
+        }
+      }
+    }
+  }
+}
+"""
+
+_RESOLVE_MUTATION = """
+mutation ($threadId: ID!) {
+  resolveReviewThread(input: { threadId: $threadId }) { thread { id isResolved } }
+}
+"""
+
+
+def fetch_review_threads(ref: PullRequestRef, token: str = "") -> list[dict[str, Any]]:
+    """Review threads with their first comment: id, resolved, path, line, body, author."""
+    threads: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        data = graphql(
+            _THREADS_QUERY,
+            {"owner": ref.owner, "name": ref.repo, "number": ref.number, "cursor": cursor},
+            token=token,
+        )
+        page = ((data.get("repository") or {}).get("pullRequest") or {}).get("reviewThreads") or {}
+        for node in page.get("nodes") or []:
+            first = ((node.get("comments") or {}).get("nodes") or [None])[0] or {}
+            threads.append(
+                {
+                    "id": node.get("id") or "",
+                    "resolved": bool(node.get("isResolved")),
+                    "path": node.get("path") or "",
+                    "line": node.get("line"),
+                    "original_line": node.get("originalLine"),
+                    "comment_id": first.get("databaseId"),
+                    "body": first.get("body") or "",
+                    "url": first.get("url") or "",
+                    "author": (first.get("author") or {}).get("login") or "",
+                }
+            )
+        info = page.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            return threads
+        cursor = info.get("endCursor")
+
+
+def resolve_review_thread(thread_id: str, token: str = "") -> None:
+    graphql(_RESOLVE_MUTATION, {"threadId": thread_id}, token=token)

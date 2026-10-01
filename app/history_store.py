@@ -31,6 +31,11 @@ class HistoryEntry:
     reviewer_prompt_content: str = ""
     result: str = ""
     summary_lines: list[str] = field(default_factory=list)
+    # Structured review data (peer reviews only): which commit the pass
+    # covered and its findings, so a re-review can report on each one.
+    head_sha: str = ""
+    base_sha: str = ""
+    review: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "HistoryEntry":
@@ -50,6 +55,9 @@ class HistoryEntry:
             reviewer_prompt_content=str(data.get("reviewer_prompt_content") or ""),
             result=str(data.get("result") or ""),
             summary_lines=[str(s) for s in summary],
+            head_sha=str(data.get("head_sha") or ""),
+            base_sha=str(data.get("base_sha") or ""),
+            review=data.get("review") if isinstance(data.get("review"), dict) else {},
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -139,6 +147,9 @@ def add_history_entry(
     reviewer_prompt_name: str = "",
     reviewer_prompt_content: str = "",
     summary_lines: list[str] | None = None,
+    head_sha: str = "",
+    base_sha: str = "",
+    review: dict[str, Any] | None = None,
 ) -> HistoryEntry:
     entries = list_history()
     entry = HistoryEntry(
@@ -154,6 +165,9 @@ def add_history_entry(
         reviewer_prompt_content=reviewer_prompt_content or "",
         result=(result or "").strip(),
         summary_lines=list(summary_lines or []),
+        head_sha=head_sha or "",
+        base_sha=base_sha or "",
+        review=dict(review or {}),
     )
     entries.insert(0, entry)
     save_all(entries)

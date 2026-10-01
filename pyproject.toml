@@ -1,0 +1,11 @@
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["pr-review-app"]
+
+[tool.ruff.lint]
+# Correctness checks only; the existing code predates a style pass.
+select = ["E9", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
