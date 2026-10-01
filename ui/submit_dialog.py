@@ -73,11 +73,17 @@ class SubmitReviewDialog(tk.Toplevel):
         ).pack(anchor="w")
         if r.verdict_reason:
             ttk.Label(header, text=r.verdict_reason, wraplength=880, justify=tk.LEFT).pack(anchor="w")
+        hint_row = ttk.Frame(header)
+        hint_row.pack(fill=tk.X, pady=(2, 0))
         ttk.Label(
-            header,
+            hint_row,
             text="Edit anything, untick what shouldn't go, then submit as one review. Nothing posts until you click.",
             foreground="#57606a",
-        ).pack(anchor="w", pady=(2, 0))
+        ).pack(side=tk.LEFT)
+        if findings:
+            ttk.Button(hint_row, text="Expand all", command=lambda: self._toggle_all(False)).pack(side=tk.RIGHT)
+            ttk.Button(hint_row, text="Collapse all", command=lambda: self._toggle_all(True)).pack(
+                side=tk.RIGHT, padx=(0, 6))
         if r.parse_mode == "legacy":
             tk.Label(
                 header, text="Parsed via legacy fallback: the JSON output didn't parse, so titles and suggestions are missing.",
@@ -173,6 +179,9 @@ class SubmitReviewDialog(tk.Toplevel):
 
         top = ttk.Frame(card)
         top.pack(fill=tk.X)
+        arrow = tk.Label(top, text="▾", cursor="hand2", font=("Segoe UI", 10), width=2)
+        arrow.pack(side=tk.LEFT)
+        Tooltip(arrow, "Collapse or expand this finding.")
         include = tk.BooleanVar(value=f.include)
         ttk.Checkbutton(top, variable=include, command=self._regenerate_summary).pack(side=tk.LEFT)
         tk.Label(top, text=SEVERITY_LABELS.get(sev, sev).upper(), foreground=SEV_COLORS.get(sev, "#333"),
@@ -186,10 +195,18 @@ class SubmitReviewDialog(tk.Toplevel):
         if f.also_flagged_by:
             ttk.Label(top, text=f"also flagged by {f.also_flagged_by}", foreground="#1a7f37").pack(side=tk.LEFT, padx=(8, 0))
 
+        title_var = tk.StringVar(value=f.title)
+        # Shown in the header only while the card is collapsed.
+        preview = ttk.Label(top, textvariable=title_var, foreground="#57606a", cursor="hand2")
+        content = ttk.Frame(card)
+        content.pack(fill=tk.X, expand=True)
+        for w in (top, arrow, preview):
+            w.bind("<Button-1>", lambda _e, k=id(f): self._toggle_card(k))
+
         anchorable = inline_payload(f, self.prep.file_diffs, self.diff.head_sha) is not None
         not_in_diff_mode = tk.StringVar(value="summary")
         if not anchorable and f.line is not None:
-            row = tk.Frame(card, background="#ffebe9")
+            row = tk.Frame(content, background="#ffebe9")
             row.pack(fill=tk.X, pady=(4, 0))
             tk.Label(row, text=f"Not in diff: {f.problem or NOT_IN_DIFF}. GitHub can't anchor it inline.",
                      background="#ffebe9", foreground="#cf222e").pack(side=tk.LEFT, padx=4)
@@ -197,30 +214,29 @@ class SubmitReviewDialog(tk.Toplevel):
                 tk.Radiobutton(row, text=label, variable=not_in_diff_mode, value=value, background="#ffebe9",
                                command=self._regenerate_summary).pack(side=tk.LEFT, padx=4)
 
-        title_var = tk.StringVar(value=f.title)
-        title_row = ttk.Frame(card)
+        title_row = ttk.Frame(content)
         title_row.pack(fill=tk.X, pady=(4, 2))
         ttk.Label(title_row, text="Title").pack(side=tk.LEFT)
         ttk.Entry(title_row, textvariable=title_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
         body = f.comment.strip()
-        text = tk.Text(card, height=min(8, max(3, body.count("\n") + 2, len(body) // 110 + 2)), wrap=tk.WORD,
+        text = tk.Text(content, height=min(8, max(3, body.count("\n") + 2, len(body) // 110 + 2)), wrap=tk.WORD,
                        font=("Segoe UI", 9))
         text.insert("1.0", body)
         text.pack(fill=tk.X, expand=True)
         if f.suggestion:
-            ttk.Label(card, text="Suggested replacement (posted as a GitHub suggestion when every cited line is in the diff):",
+            ttk.Label(content, text="Suggested replacement (posted as a GitHub suggestion when every cited line is in the diff):",
                       foreground="#57606a").pack(anchor="w", pady=(4, 0))
-            sugg = tk.Text(card, height=min(6, f.suggestion.count("\n") + 1), wrap=tk.NONE, font=("Consolas", 9),
+            sugg = tk.Text(content, height=min(6, f.suggestion.count("\n") + 1), wrap=tk.NONE, font=("Consolas", 9),
                            background="#f6f8fa")
             sugg.insert("1.0", f.suggestion)
             sugg.pack(fill=tk.X)
         else:
             sugg = None
         if f.verifier_note:
-            ttk.Label(card, text=f"Verifier: {f.verifier_note}", foreground="#57606a").pack(anchor="w")
+            ttk.Label(content, text=f"Verifier: {f.verifier_note}", foreground="#57606a").pack(anchor="w")
 
-        actions = ttk.Frame(card)
+        actions = ttk.Frame(content)
         actions.pack(fill=tk.X, pady=(4, 0))
         post_btn = ttk.Button(actions, text="Post this one" if anchorable else "Post as PR comment")
         post_btn.configure(command=lambda c=f: self._post_one(c))
@@ -243,7 +259,27 @@ class SubmitReviewDialog(tk.Toplevel):
         self._cards[id(f)] = {
             "finding": f, "include": include, "title": title_var, "text": text, "suggestion": sugg,
             "mode": not_in_diff_mode, "button": post_btn, "status": status, "anchorable": anchorable,
+            "body": content, "arrow": arrow, "preview": preview, "collapsed": False,
         }
+
+    def _toggle_card(self, key: int, collapse: bool | None = None) -> None:
+        card = self._cards[key]
+        collapse = not card["collapsed"] if collapse is None else collapse
+        if collapse == card["collapsed"]:
+            return
+        card["collapsed"] = collapse
+        if collapse:
+            card["body"].pack_forget()
+            card["preview"].pack(side=tk.LEFT, padx=(10, 0))
+            card["arrow"].configure(text="▸")
+        else:
+            card["preview"].pack_forget()
+            card["body"].pack(fill=tk.X, expand=True)
+            card["arrow"].configure(text="▾")
+
+    def _toggle_all(self, collapse: bool) -> None:
+        for key in self._cards:
+            self._toggle_card(key, collapse)
 
     def _build_prior(self, parent: tk.Misc) -> None:
         box = ttk.LabelFrame(parent, text="Since last review", padding=8)
