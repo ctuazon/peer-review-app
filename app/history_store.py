@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app import HISTORY_PATH, ensure_data_dir, load_json, save_json
+from app.review_schema import INCONCLUSIVE
 
 MAX_HISTORY_ENTRIES = 200
 
@@ -108,14 +109,16 @@ def pr_key(pr_url: str) -> str:
 
 
 def list_reviews_for_pr(pr_url: str) -> list[HistoryEntry]:
-    """Past peer-review runs for the same repo + PR number, newest first."""
+    """Past peer-review runs for the same repo + PR number, newest first. A
+    run that reached no verdict is not a pass, so a follow-up never treats
+    its commit as already reviewed."""
     key = pr_key(pr_url)
     if not key:
         return []
     return [
         e
         for e in list_history()
-        if e.mode == "review" and e.result and pr_key(e.pr_url) == key
+        if e.mode == "review" and e.result and pr_key(e.pr_url) == key and e.review.get("verdict") != INCONCLUSIVE
     ]
 
 

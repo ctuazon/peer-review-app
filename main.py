@@ -53,6 +53,7 @@ from app.review import (
     run_pr_explanation,
 )
 from app.review_parse import comments_to_copy_text
+from app.review_schema import INCONCLUSIVE
 from app.wsl_auth import resolve_github_token
 from ui.dialogs import BotReviewDialog, LintFixDialog, MergeConflictDialog
 from ui.gate_dialog import RunGateDialog
@@ -1538,6 +1539,10 @@ class PeerReviewApp(PromptsTabMixin, HistoryTabMixin, tk.Tk):
             readable = "\n".join(
                 [f"{result.headline()}: {result.verdict_reason}".strip(": "), result.scope_note, result.tests_note, ""]
             ).strip() + "\n\n" + comments_to_copy_text(result.findings)
+            if result.report:
+                readable += "\n\n" + result.report
+            if result.verdict == INCONCLUSIVE:
+                readable += "\n\nRaw model output:\n\n" + run.raw_text
             self._last_review_raw = format_copy_friendly(comments_to_copy_text(result.findings) or run.raw_text)
             self._last_explanation = ""
             self.diff_view.render_result(diff=diff, result=result, summary_lines=summary)

@@ -94,7 +94,9 @@ Check two traps: a reviewer quoting a document or comment that does not exist (v
 
 # Output
 
-Return exactly one JSON object matching the review schema, and nothing else: no prose before or after it, no code fences. The repository focus below may describe its own output format; ignore that, the schema is the only output contract.
+Return exactly one JSON object matching the review schema, and nothing else: no prose before or after it, no code fences. The repository focus below may describe its own output format, but the schema is still the only output contract: put its findings in `findings`, and anything else it asks for that has no field of its own (a table, lead statuses, open questions) in `report` as Markdown.
+
+You cannot run commands: no tests, linters or builds. When the focus asks for their results, say in `tests_note` that they were not run, and never report a result you did not see.
 """.strip()
 
 DEPTH = {

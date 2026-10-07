@@ -12,6 +12,7 @@ from app.bot_review import (
     apply_bot_fixes_batch,
     post_bot_reply,
 )
+from app.cost import EFFORTS
 from app.github_pr import PullRequestDiff, parse_pr_url
 from app.history_store import (
     list_history,
@@ -102,14 +103,26 @@ class PromptEditorDialog(tk.Toplevel):
             command=self._on_generic_toggle,
         ).grid(row=2, column=1, sticky="w", pady=4)
 
-        ttk.Label(frame, text="Prompt").grid(row=3, column=0, sticky="nw")
+        ttk.Label(frame, text="Minimum effort").grid(row=3, column=0, sticky="w")
+        self.min_effort_var = tk.StringVar(value=prompt.min_effort if prompt else "")
+        effort_row = ttk.Frame(frame)
+        effort_row.grid(row=3, column=1, sticky="ew", pady=4)
+        ttk.Combobox(
+            effort_row, textvariable=self.min_effort_var, width=10, state="readonly", values=["", *EFFORTS]
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            effort_row,
+            text="(reviews with this prompt run at least this deep; a choice on the review tab still wins)",
+        ).pack(side=tk.LEFT, padx=8)
+
+        ttk.Label(frame, text="Prompt").grid(row=4, column=0, sticky="nw")
         self.content = scrolledtext.ScrolledText(frame, width=70, height=18, wrap=tk.WORD)
-        self.content.grid(row=3, column=1, sticky="nsew", pady=4)
+        self.content.grid(row=4, column=1, sticky="nsew", pady=4)
         if prompt:
             self.content.insert("1.0", prompt.content)
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=4, column=1, sticky="e", pady=(8, 0))
+        buttons.grid(row=5, column=1, sticky="e", pady=(8, 0))
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=4)
         tip(
             ttk.Button(buttons, text="Save", command=self._save),
@@ -117,9 +130,9 @@ class PromptEditorDialog(tk.Toplevel):
         ).pack(side=tk.RIGHT)
 
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(4, weight=1)
         self._on_generic_toggle()
-        self.geometry("720x520")
+        self.geometry("720x560")
         self.wait_visibility()
         self.focus_force()
 
@@ -133,6 +146,7 @@ class PromptEditorDialog(tk.Toplevel):
         name = self.name_var.get().strip()
         content = self.content.get("1.0", "end-1c")
         is_generic = bool(self.generic_var.get())
+        min_effort = self.min_effort_var.get()
         repo_type = GENERIC_REPO_TYPE if is_generic else self.repo_var.get().strip()
         if not name:
             messagebox.showerror("Missing name", "Please enter a prompt name.", parent=self)
@@ -152,6 +166,7 @@ class PromptEditorDialog(tk.Toplevel):
                     repo_type=repo_type,
                     content=content,
                     is_generic=is_generic,
+                    min_effort=min_effort,
                 )
             else:
                 self.result = create_prompt(
@@ -159,6 +174,7 @@ class PromptEditorDialog(tk.Toplevel):
                     repo_type=repo_type,
                     content=content,
                     is_generic=is_generic,
+                    min_effort=min_effort,
                 )
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Save failed", str(exc), parent=self)

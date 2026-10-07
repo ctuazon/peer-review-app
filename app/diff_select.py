@@ -44,7 +44,7 @@ CONFIG = ["config/**", "**/*.json", "**/*.yml", "**/*.yaml", "**/*.xml", "**/*.i
 
 # Code runs nearer three characters to a token than four; err on showing less.
 CHARS_PER_TOKEN = 3
-DEFAULT_MAX_CHARS = 360_000  # ~120K tokens of annotated diff
+DEFAULT_MAX_CHARS = 900_000  # ~300K tokens of annotated diff; config `max_diff_chars` overrides it
 
 WITHHELD_SECRET = "secret-bearing by name"
 GENERATED_REASON = "generated or vendored"
@@ -60,6 +60,10 @@ class DiffSelection:
     @property
     def withheld_secret(self) -> list[str]:
         return [p for p, why in self.omitted.items() if why == WITHHELD_SECRET]
+
+    @property
+    def over_budget(self) -> list[str]:
+        return [p for p, why in self.omitted.items() if why == OVER_BUDGET]
 
 
 def is_secret_path(path: str) -> bool:

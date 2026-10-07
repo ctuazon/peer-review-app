@@ -26,6 +26,7 @@ from app.github_pr import (
 from app.review_parse import ReviewComment
 from app.review_prompts import fix_prompt
 from app.review_schema import (
+    INCONCLUSIVE,
     SEVERITIES,
     SEVERITY_LABELS,
     Disagreement,
@@ -124,7 +125,9 @@ def render_summary(data: SummaryInput, inline_ids: set[int] | None = None) -> st
     r = data.result
     posted = data.findings
     blockers = sum(1 for f in posted if f.severity == "blocker")
-    if r.verdict == "approve":
+    if r.verdict == INCONCLUSIVE:
+        headline = "Review incomplete"
+    elif r.verdict == "approve":
         headline = "Approve"
     elif r.verdict == "approve_with_nits":
         headline = "Approve with nits"

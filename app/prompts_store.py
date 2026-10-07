@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from app import PROMPTS_PATH, ensure_data_dir, load_json, save_json
+from app.cost import EFFORTS
 
 GENERIC_REPO_TYPE = "generic"
 
@@ -20,6 +21,8 @@ class Prompt:
     # [{"path": "src/Api/**", "instructions": "..."}]: asked of the model only
     # when a changed file matches the glob.
     path_instructions: list[dict[str, str]] = field(default_factory=list)
+    # A review run with this prompt never goes below this effort; blank sets no floor.
+    min_effort: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Prompt":
@@ -28,6 +31,7 @@ class Prompt:
             is_generic = repo_type == GENERIC_REPO_TYPE
         else:
             is_generic = bool(data["is_generic"])
+        min_effort = str(data.get("min_effort") or "").strip().lower()
         if is_generic:
             repo_type = GENERIC_REPO_TYPE
         return cls(
@@ -41,6 +45,7 @@ class Prompt:
                 for item in data.get("path_instructions") or []
                 if isinstance(item, dict) and item.get("path") and item.get("instructions")
             ],
+            min_effort=min_effort if min_effort in EFFORTS else "",
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -70,6 +75,7 @@ def create_prompt(
     repo_type: str,
     content: str,
     is_generic: bool = False,
+    min_effort: str = "",
 ) -> Prompt:
     prompts = list_prompts()
     prompt = Prompt.from_dict(
@@ -79,6 +85,7 @@ def create_prompt(
             "repo_type": repo_type,
             "content": content,
             "is_generic": is_generic,
+            "min_effort": min_effort,
         }
     )
     prompts.append(prompt)
@@ -93,6 +100,7 @@ def update_prompt(
     repo_type: str | None = None,
     content: str | None = None,
     is_generic: bool | None = None,
+    min_effort: str | None = None,
 ) -> Prompt:
     prompts = list_prompts()
     for i, prompt in enumerate(prompts):
@@ -107,6 +115,8 @@ def update_prompt(
             data["content"] = content
         if is_generic is not None:
             data["is_generic"] = is_generic
+        if min_effort is not None:
+            data["min_effort"] = min_effort
         updated = Prompt.from_dict(data)
         prompts[i] = updated
         save_all(prompts)

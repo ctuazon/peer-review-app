@@ -13,13 +13,14 @@ from app.review_parse import (
     comments_to_copy_text,
     parse_review_comments,
 )
-from app.review_schema import ReviewResult
+from app.review_schema import INCONCLUSIVE, ReviewResult
 from ui.widgets import Tooltip, tip
 
 VERDICT_STYLES = {
     "approve": ("#dafbe1", "#1a7f37"),
     "approve_with_nits": ("#ddf4ff", "#0550ae"),
     "changes_requested": ("#ffebe9", "#cf222e"),
+    INCONCLUSIVE: ("#fff8c5", "#9a6700"),
 }
 STATUS_ICONS = {"fixed": "✅", "open": "⏳", "withdrawn": "↩", "changed": "✏"}
 
@@ -560,7 +561,13 @@ class DiffReviewView(ttk.Frame):
         if result.parse_mode == "legacy":
             tk.Label(box, text="Parsed via legacy fallback: the JSON output didn't parse.",
                      background="#fff8c5", foreground="#9a6700", anchor="w").pack(fill=tk.X, pady=(4, 0))
-        if not result.findings:
+        if result.report:
+            tk.Label(box, text="Report:\n" + result.report, background=bg, foreground="#1f2328", anchor="w",
+                     justify=tk.LEFT, wraplength=880).pack(fill=tk.X, pady=(4, 0))
+        if result.verdict == INCONCLUSIVE:
+            tk.Label(box, text="Open this run in History to see Claude's raw output.", background=bg,
+                     foreground=fg, anchor="w").pack(fill=tk.X, pady=(4, 0))
+        elif not result.findings:
             tk.Label(box, text="No findings: nothing to post inline.", background=bg, foreground=fg,
                      anchor="w").pack(fill=tk.X, pady=(4, 0))
 

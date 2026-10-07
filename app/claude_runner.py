@@ -61,6 +61,7 @@ class ClaudeResult:
     session_id: str = ""
     cost_usd: float | None = None
     stop_reason: str = ""
+    is_error: bool = False
 
 
 @dataclass
@@ -222,8 +223,11 @@ def _parse_stream_line(
                 state.session_id = str(obj["session_id"])
             if isinstance(cost, (int, float)):
                 state.cost_usd = float(cost)
-            state.stop_reason = str(obj.get("stop_reason") or obj.get("terminal_reason") or "")
             state.is_error = bool(obj.get("is_error"))
+            # An errored run (out of turns, failed mid-tool) may name why only in `subtype`.
+            state.stop_reason = str(
+                obj.get("stop_reason") or obj.get("terminal_reason") or (obj.get("subtype") if state.is_error else "") or ""
+            )
         if isinstance(usage, dict):
             _emit_usage(
                 on_event,
@@ -429,7 +433,7 @@ def run_claude_wsl_result(
         empty_message="Claude (WSL) returned no output.",
         structured=state.structured,
     )
-    return ClaudeResult(text, state.structured, state.session_id, state.cost_usd, state.stop_reason)
+    return ClaudeResult(text, state.structured, state.session_id, state.cost_usd, state.stop_reason, state.is_error)
 
 
 def run_claude_cli_result(
@@ -491,7 +495,7 @@ def run_claude_cli_result(
                 empty_message="Claude CLI returned no output.",
                 structured=state.structured,
             )
-            return ClaudeResult(text, state.structured, state.session_id, state.cost_usd, state.stop_reason)
+            return ClaudeResult(text, state.structured, state.session_id, state.cost_usd, state.stop_reason, state.is_error)
         except ClaudeError:
             # Fall back to non-stream text mode.
             pass

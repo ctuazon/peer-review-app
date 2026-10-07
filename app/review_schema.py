@@ -23,6 +23,9 @@ VERDICTS = ("approve", "approve_with_nits", "changes_requested")
 PRIOR_STATUSES = ("fixed", "open", "changed", "withdrawn")
 CONFIDENCES = ("high", "medium", "low")
 NOT_IN_DIFF = "line not in diff"
+# Never offered to the model. A run whose output can't be read reached no
+# verdict, and must not read as a clean bill of health.
+INCONCLUSIVE = "inconclusive"
 
 
 def _obj(properties: dict[str, Any]) -> dict[str, Any]:
@@ -98,6 +101,10 @@ def review_schema() -> dict[str, Any]:
             "prior_findings": {"type": "array", "items": prior, "description": "Re-review only; empty otherwise."},
             "disagreements": {"type": "array", "items": disagreement},
             "credits": {"type": "array", "items": credit},
+            "report": {
+                "type": "string",
+                "description": "Markdown for anything the focus prompt asks for that has no field here, such as a table, lead statuses or open questions. Empty when there is nothing to add.",
+            },
         }
     )
 
@@ -165,6 +172,7 @@ class ReviewResult:
     verdict_reason: str = ""
     scope_note: str = ""
     tests_note: str = ""
+    report: str = ""
     findings: list[ReviewComment] = field(default_factory=list)
     prior: list[PriorStatus] = field(default_factory=list)
     disagreements: list[Disagreement] = field(default_factory=list)
@@ -186,6 +194,8 @@ class ReviewResult:
 
     def headline(self) -> str:
         blockers = len(self.by_severity("blocker"))
+        if self.verdict == INCONCLUSIVE:
+            return "Inconclusive: no verdict reached"
         if self.verdict == "approve":
             return "Approve"
         if self.verdict == "approve_with_nits":
@@ -201,6 +211,7 @@ class ReviewResult:
             "verdict_reason": self.verdict_reason,
             "scope_note": self.scope_note,
             "tests_note": self.tests_note,
+            "report": self.report,
             "findings": [finding_to_dict(f) for f in self.findings],
             "prior_findings": [
                 {"fp": p.fp, "title": p.title, "status": p.status, "note": p.note,
@@ -371,6 +382,7 @@ def result_from_payload(payload: dict[str, Any]) -> ReviewResult:
         verdict_reason=str(payload.get("verdict_reason") or "").strip(),
         scope_note=str(payload.get("scope_note") or "").strip(),
         tests_note=str(payload.get("tests_note") or "").strip(),
+        report=str(payload.get("report") or "").strip(),
         findings=findings,
         prior=prior,
         disagreements=disagreements,
@@ -392,6 +404,12 @@ def derive_verdict(findings: list[ReviewComment]) -> str:
     return "approve"
 
 
+def inconclusive(text: str, reason: str) -> ReviewResult:
+    """A run that produced nothing readable; its raw output is kept so the
+    user can see what the model actually said."""
+    return ReviewResult(verdict=INCONCLUSIVE, verdict_reason=reason, parse_mode="legacy", raw_text=text)
+
+
 def parse_review_output(text: str, structured: dict[str, Any] | None = None) -> ReviewResult:
     """Structured output first, then any JSON object in the text, then the
     legacy FILE:/LINE: blocks. `parse_mode` says which one worked."""
@@ -402,6 +420,8 @@ def parse_review_output(text: str, structured: dict[str, Any] | None = None) -> 
         return result
 
     comments = parse_review_comments(text)
+    if not comments:
+        return inconclusive(text, "The model's output couldn't be read as a review, so no verdict was reached.")
     # Legacy praise entries are not findings; the verdict covers them.
     usable = [c for c in comments if not c.problem and c.severity != "praise"]
     rejected = [c for c in comments if c.problem]

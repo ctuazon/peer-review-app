@@ -32,6 +32,9 @@ DEFAULT_CONFIG = {
     "jira_api_token": "",
     # Peer review defaults; .github/pr-review.yml and the review tab override.
     "review_effort": "medium",
+    # Characters of annotated diff sent to the model (about 3 per token). Files
+    # past it are withheld whole and the run is flagged as a partial review.
+    "max_diff_chars": 900_000,
     # Pick the review model and effort by how many changed lines the model is
     # sent (on a re-review, just the lines changed since the last pass). The
     # first tier whose max_lines covers it wins; null covers anything. Off,

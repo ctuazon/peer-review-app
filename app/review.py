@@ -15,6 +15,7 @@ from app.claude_runner import (
     REPO_TOOLS,
     ALLOWED_TOOLS,
     ClaudeError,
+    ClaudeResult,
     CliOptions,
     _timeout,
     api_fallback_note,
@@ -43,7 +44,14 @@ from app.context import (
 )
 from app.cost import estimate_cost, estimate_tokens
 from app.diff_model import FileDiff, build_file_diffs
-from app.diff_select import DiffSelection, render_delta, render_selected, review_delta, select_diffs
+from app.diff_select import (
+    DEFAULT_MAX_CHARS,
+    DiffSelection,
+    render_delta,
+    render_selected,
+    review_delta,
+    select_diffs,
+)
 from app.eligibility import eligibility_warnings
 from app.github_pr import PullRequestDiff, fetch_pull_request, get_file_text, summarize_diff_for_prompt
 from app.globs import matches
@@ -60,6 +68,7 @@ from app.review_prompts import (
     verification_parts,
 )
 from app.review_schema import (
+    INCONCLUSIVE,
     SEVERITIES,
     SEVERITY_RANK,
     ReviewResult,
@@ -258,7 +267,11 @@ def prepare_review(
     file_diffs = build_file_diffs(diff.files)
     secrets = scan_diffs(file_diffs)
     masked = mask_diffs(file_diffs)
-    selection = select_diffs(masked, exclude_globs=repo_cfg.exclude_globs)
+    selection = select_diffs(
+        masked,
+        exclude_globs=repo_cfg.exclude_globs,
+        max_chars=int(config.get("max_diff_chars") or DEFAULT_MAX_CHARS),
+    )
 
     _status(on_event, f"loaded {len(diff.files)} files, gathering context")
     conventions = load_conventions(diff, token)
@@ -297,6 +310,7 @@ def prepare_review(
         },
         overrides={"model": options.model, "effort": options.effort, "mode": options.mode, "verify": options.verify},
         review_lines=review_lines,
+        min_effort=reviewer_prompt.min_effort if reviewer_prompt else "",
     )
 
     path_instructions: list[tuple[list[str], str]] = []
@@ -314,6 +328,11 @@ def prepare_review(
     )
     if settings.skip_reason:
         warnings.append(f"pr-review.yml {settings.skip_reason}.")
+    if selection.over_budget:
+        warnings.append(
+            f"Partial review: {len(selection.over_budget)} of {len(diff.files)} changed files are over the "
+            "input budget, so the model won't see their diffs."
+        )
 
     agentic_available = effective_mode(config) != "api"
     if api_fallback_note(config):
@@ -363,7 +382,7 @@ def _call(
     on_event: EventFn | None,
     schema: dict[str, Any],
     cwd: str | None,
-) -> tuple[str, dict[str, Any] | None, str, float | None]:
+) -> ClaudeResult:
     if effective_mode(config) == "api":
         result = run_claude_api_result(
             api_key=resolve_api_key(config),
@@ -375,7 +394,7 @@ def _call(
             json_schema=schema,
             timeout=_timeout(config),
         )
-        return result.text, None, "", None
+        return result
     result = run_claude_cli_any(
         parts.combined(),
         config,
@@ -389,7 +408,7 @@ def _call(
             timeout=_timeout(config),
         ),
     )
-    return result.text, result.structured, result.session_id, result.cost_usd
+    return result
 
 
 def _conclude(
@@ -470,16 +489,22 @@ def execute_review(prep: ReviewPrep, config: dict[str, Any], on_event: EventFn |
     schema = review_schema()
 
     _status(on_event, f"asking {prep.settings.model} ({prep.settings.effort}, {'agentic' if prep.agentic else 'single-shot'})")
-    text, structured, session_id, cost = _call(prep, parts, config, on_event, schema, cwd)
-    result = parse_review_output(text, structured)
-    if result.parse_mode == "legacy" and session_id:
+    first = _call(prep, parts, config, on_event, schema, cwd)
+    text, cost = first.text, first.cost_usd
+    result = parse_review_output(text, first.structured)
+    if result.parse_mode == "legacy" and first.session_id:
         try:
-            text2, structured2 = _conclude(session_id, prep, config, on_event, schema, cwd)
+            text2, structured2 = _conclude(first.session_id, prep, config, on_event, schema, cwd)
             retry = parse_review_output(text2, structured2)
             if retry.parse_mode == "json":
                 result, text = retry, text2
         except ClaudeError:
             pass
+    if result.verdict == INCONCLUSIVE and first.is_error:
+        result.verdict_reason = (
+            f"Claude ended with an error ({first.stop_reason or 'no reason given'}) before writing a review, "
+            "so no verdict was reached."
+        )
 
     assign_fingerprints(result.findings, prep.file_diffs)
     if prep.re_review:
@@ -512,10 +537,10 @@ def verify_findings(
     _status(on_event, f"verifying {len(run.result.findings)} finding(s)")
     parts = verification_parts(prep.parts or prep.build_parts(), _findings_to_verify(run.result.findings))
     try:
-        text, structured, _sid, _cost = _call(prep, parts, config, on_event, verification_schema(), cwd)
+        answer = _call(prep, parts, config, on_event, verification_schema(), cwd)
     except ClaudeError as exc:
         return f"Verification failed ({exc}); findings kept as they were."
-    payload = structured if isinstance(structured, dict) else extract_json_object(text)
+    payload = answer.structured if isinstance(answer.structured, dict) else extract_json_object(answer.text)
     verdicts = (payload or {}).get("verdicts")
     if not isinstance(verdicts, list):
         return "Verifier output didn't parse; findings kept as they were."
@@ -536,7 +561,12 @@ def review_summary_lines(run: ReviewRun) -> list[str]:
         ("Pass: re-review since " + (prep.prior.last_sha[:7] or "an earlier pass")
          + (", changes only" if prep.delta is not None else "")) if prep.re_review else "Pass: full review",
         f"Auth: {prep.auth_source}",
+        "Tests run: none. The reviewer can't execute commands, so test and lint results are unverified.",
     ]
+    if prep.selection.over_budget:
+        lines.append(
+            f"Partial review: {len(prep.selection.over_budget)} file(s) over the input budget were not shown to the model."
+        )
     if run.cost_usd is not None:
         lines.append(f"Cost: ${run.cost_usd:.3f}")
     if result.parse_mode == "legacy":
@@ -722,7 +752,13 @@ def format_copy_friendly(review_text: str) -> str:
     return text + ("\n" if not text.endswith("\n") else "")
 
 
+# Enough for any review's JSON; a runaway transcript is cut rather than
+# bloating history.json.
+RAW_TEXT_LIMIT = 200_000
+
+
 def review_to_history(run: ReviewRun) -> dict[str, Any]:
     data = run.result.to_dict()
     data["parse_mode"] = run.result.parse_mode
+    data["raw_text"] = run.raw_text[:RAW_TEXT_LIMIT]
     return data

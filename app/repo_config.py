@@ -275,8 +275,10 @@ def resolve_settings(
     desktop: dict[str, Any],
     overrides: dict[str, Any] | None = None,
     review_lines: int = 0,
+    min_effort: str = "",
 ) -> ResolvedSettings:
     """Merge desktop defaults < yml defaults < matching tier < UI overrides.
+    The reviewer prompt's `min_effort` then raises any lower effort except a UI choice.
 
     With desktop["size_tiers"], the desktop model and effort come from the
     tier matching `review_lines` (the changed lines the model will be sent)."""
@@ -313,6 +315,10 @@ def resolve_settings(
     for key, value in (overrides or {}).items():
         if key in values and value not in (None, ""):
             values[key] = (value, "UI")
+
+    effort, source = values["effort"]
+    if min_effort in EFFORTS and source != "UI" and effort in EFFORTS and EFFORTS.index(effort) < EFFORTS.index(min_effort):
+        values["effort"] = (min_effort, "reviewer prompt minimum")
 
     out.model, out.effort, out.mode = values["model"][0], values["effort"][0], values["mode"][0]
     out.verify = bool(values["verify"][0])
