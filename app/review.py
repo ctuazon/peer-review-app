@@ -242,6 +242,13 @@ def _token(config: dict[str, Any]) -> tuple[str, str]:
     )
 
 
+def is_follow_up(prior: PriorState, head_sha: str, wanted: bool = True) -> bool:
+    """A follow-up needs an earlier pass of a different commit. Re-running the
+    commit already reviewed is a fresh pass: a follow-up of it would have
+    nothing new to look at and only report on old threads."""
+    return wanted and prior.is_re_review and prior.last_sha != head_sha
+
+
 def prepare_review(
     *,
     pr_url: str,
@@ -289,7 +296,7 @@ def prepare_review(
     last_sha = prior.last_sha or (newest_structured.head_sha if newest_structured is not None else "")
     if not prior.last_sha:
         prior.last_sha = last_sha
-    re_review = options.follow_up and prior.is_re_review
+    re_review = is_follow_up(prior, diff.head_sha, wanted=options.follow_up)
     since = load_since_last(diff, last_sha, token) if re_review else None
     delta = review_delta(since.diffs, masked, selection) if since is not None else None
     sent = delta if delta is not None else {p: masked[p] for p in selection.shown}

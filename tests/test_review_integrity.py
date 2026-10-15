@@ -1,13 +1,14 @@
 import json
 
 from app.claude_runner import _parse_stream_line, _StreamState
+from app.context import PriorState
 from app.diff_model import parse_file_patch
 from app.diff_select import OVER_BUDGET, select_diffs
 from app import history_store
 from app.history_store import HistoryEntry, list_reviews_for_pr
 from app.prompts_store import Prompt
 from app.repo_config import parse_repo_config, resolve_settings
-from app.review import RAW_TEXT_LIMIT, ReviewRun, review_to_history
+from app.review import RAW_TEXT_LIMIT, ReviewRun, is_follow_up, review_to_history
 from app.review_prompts import RUBRIC
 from app.review_schema import INCONCLUSIVE, ReviewResult, parse_review_output, review_schema
 
@@ -97,3 +98,23 @@ def test_prompt_minimum_effort_ignores_unknown_values():
     prompt = Prompt.from_dict({"name": "p", "content": "c", "min_effort": "extreme"})
     assert prompt.min_effort == ""
     assert Prompt.from_dict({"name": "p", "content": "c", "min_effort": "High"}).min_effort == "high"
+
+
+def test_an_unread_run_saved_before_the_fix_is_not_a_pass(monkeypatch):
+    def entry(name, **review):
+        return HistoryEntry(id=name, created_at="", mode="review", pr_url=PR, result="r", review=review)
+
+    entries = [
+        entry("unread", verdict="approve", parse_mode="legacy", findings=[]),
+        entry("legacy-with-findings", verdict="changes_requested", parse_mode="legacy", findings=[{"title": "t"}]),
+        entry("clean-json", verdict="approve", parse_mode="json", findings=[]),
+    ]
+    monkeypatch.setattr(history_store, "list_history", lambda: entries)
+    assert [e.id for e in list_reviews_for_pr(PR)] == ["legacy-with-findings", "clean-json"]
+
+
+def test_re_running_the_reviewed_commit_is_a_fresh_pass_not_a_follow_up():
+    assert not is_follow_up(PriorState(last_sha="abc123"), "abc123")
+    assert is_follow_up(PriorState(last_sha="abc123"), "def456")
+    assert not is_follow_up(PriorState(last_sha="abc123"), "def456", wanted=False)
+    assert not is_follow_up(PriorState(), "def456")

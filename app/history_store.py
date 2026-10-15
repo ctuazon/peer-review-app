@@ -108,6 +108,15 @@ def pr_key(pr_url: str) -> str:
     return f"{ref.full_name.lower()}#{ref.number}"
 
 
+def reached_verdict(review: dict[str, Any]) -> bool:
+    """False for a run whose output couldn't be read. Runs saved before the
+    inconclusive verdict existed were recorded as a legacy-parsed approve
+    with no findings, so those count as unread too."""
+    if review.get("verdict") == INCONCLUSIVE:
+        return False
+    return not (review.get("parse_mode") == "legacy" and review.get("verdict") == "approve" and not review.get("findings"))
+
+
 def list_reviews_for_pr(pr_url: str) -> list[HistoryEntry]:
     """Past peer-review runs for the same repo + PR number, newest first. A
     run that reached no verdict is not a pass, so a follow-up never treats
@@ -118,7 +127,7 @@ def list_reviews_for_pr(pr_url: str) -> list[HistoryEntry]:
     return [
         e
         for e in list_history()
-        if e.mode == "review" and e.result and pr_key(e.pr_url) == key and e.review.get("verdict") != INCONCLUSIVE
+        if e.mode == "review" and e.result and pr_key(e.pr_url) == key and reached_verdict(e.review)
     ]
 
 
