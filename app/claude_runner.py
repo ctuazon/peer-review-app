@@ -11,7 +11,7 @@ import sys
 import tempfile
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +64,56 @@ class ClaudeResult:
     is_error: bool = False
 
 
+class _UsageMeter:
+    """Reports token usage live as each API message streams, then tops it up
+    to the authoritative end-of-call totals so nothing is counted twice."""
+
+    def __init__(self) -> None:
+        self.input = self.output = self.read = self.write = 0
+        self._message_output = 0
+        self._started = False
+
+    def add(
+        self,
+        on_event: "ClaudeEventCallback | None",
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        read: int = 0,
+        write: int = 0,
+        cost_usd: float | None = None,
+    ) -> None:
+        if not (input_tokens or output_tokens or read or write or cost_usd is not None):
+            return
+        self.input += input_tokens
+        self.output += output_tokens
+        self.read += read
+        self.write += write
+        _emit_usage(on_event, input_tokens, output_tokens, read, write, cost_usd, new_call=not self._started)
+        self._started = True
+
+    def message_start(self, on_event, input_tokens: int, output_tokens: int, read: int, write: int) -> None:
+        self._message_output = output_tokens
+        self.add(on_event, input_tokens=input_tokens, output_tokens=output_tokens, read=read, write=write)
+
+    def message_delta(self, on_event, output_total: int) -> None:
+        """output_total is cumulative for the current message."""
+        delta = output_total - self._message_output
+        if delta > 0:
+            self._message_output = output_total
+            self.add(on_event, output_tokens=delta)
+
+    def settle(self, on_event, input_tokens: int, output_tokens: int, read: int, write: int, cost_usd: float | None) -> None:
+        self.add(
+            on_event,
+            input_tokens=max(0, input_tokens - self.input),
+            output_tokens=max(0, output_tokens - self.output),
+            read=max(0, read - self.read),
+            write=max(0, write - self.write),
+            cost_usd=cost_usd,
+        )
+
+
 @dataclass
 class _StreamState:
     final_text: str = ""
@@ -72,6 +122,7 @@ class _StreamState:
     cost_usd: float | None = None
     stop_reason: str = ""
     is_error: bool = False
+    usage: _UsageMeter = field(default_factory=_UsageMeter)
 
 
 def resolve_claude_cli(configured_path: str = "claude") -> str | None:
@@ -104,7 +155,9 @@ def _emit_usage(
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
     cost_usd: float | None = None,
+    new_call: bool = False,
 ) -> None:
+    """Token counts are increments; new_call marks the first report of a call."""
     if on_event is None:
         return
     event = {
@@ -116,7 +169,26 @@ def _emit_usage(
     }
     if cost_usd is not None:
         event["cost_usd"] = f"{cost_usd:.6f}"
+    if new_call:
+        event["new_call"] = "1"
     on_event(event)
+
+
+def _usage_ints(usage: Any) -> tuple[int, int, int, int]:
+    """(input, output, cache read, cache write) from a usage dict or SDK object."""
+    def get(name: str) -> int:
+        value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, 0)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return (
+        get("input_tokens"),
+        get("output_tokens"),
+        get("cache_read_input_tokens"),
+        get("cache_creation_input_tokens"),
+    )
 
 
 def _parse_stream_line(
@@ -164,7 +236,14 @@ def _parse_stream_line(
         if not isinstance(ev, dict):
             return None
         et = ev.get("type")
-        if et == "content_block_delta":
+        if et == "message_start" and state is not None:
+            message = ev.get("message") or {}
+            if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+                state.usage.message_start(on_event, *_usage_ints(message["usage"]))
+        elif et == "message_delta" and state is not None:
+            if isinstance(ev.get("usage"), dict):
+                state.usage.message_delta(on_event, _usage_ints(ev["usage"])[1])
+        elif et == "content_block_delta":
             delta = ev.get("delta") or {}
             if not isinstance(delta, dict):
                 return None
@@ -229,14 +308,10 @@ def _parse_stream_line(
                 obj.get("stop_reason") or obj.get("terminal_reason") or (obj.get("subtype") if state.is_error else "") or ""
             )
         if isinstance(usage, dict):
-            _emit_usage(
-                on_event,
-                int(usage.get("input_tokens") or 0),
-                int(usage.get("output_tokens") or 0),
-                int(usage.get("cache_read_input_tokens") or 0),
-                int(usage.get("cache_creation_input_tokens") or 0),
-                float(cost) if isinstance(cost, (int, float)) else None,
-            )
+            # The result carries whole-run totals; only the part not already
+            # reported live from message_start/message_delta is added.
+            meter = state.usage if state is not None else _UsageMeter()
+            meter.settle(on_event, *_usage_ints(usage), float(cost) if isinstance(cost, (int, float)) else None)
         result = obj.get("result")
         if isinstance(result, str) and result.strip():
             if state is not None:
@@ -614,12 +689,24 @@ def run_claude_api_result(
 
     _emit(on_event, "status", "requesting")
     parts: list[str] = []
+    meter = _UsageMeter()
 
     def stream_once(request: dict[str, Any]):
         parts.clear()
         with client.messages.stream(**request) as stream:
             for event in stream:
-                if getattr(event, "type", "") != "content_block_delta":
+                etype = getattr(event, "type", "")
+                if etype == "message_start":
+                    usage = getattr(getattr(event, "message", None), "usage", None)
+                    if usage is not None:
+                        meter.message_start(on_event, *_usage_ints(usage))
+                    continue
+                if etype == "message_delta":
+                    usage = getattr(event, "usage", None)
+                    if usage is not None:
+                        meter.message_delta(on_event, _usage_ints(usage)[1])
+                    continue
+                if etype != "content_block_delta":
                     continue
                 delta = getattr(event, "delta", None)
                 dtype = getattr(delta, "type", "")
@@ -652,11 +739,8 @@ def run_claude_api_result(
     if usage is not None:
         from app.cost import actual_cost
 
-        in_t = int(getattr(usage, "input_tokens", 0) or 0)
-        out_t = int(getattr(usage, "output_tokens", 0) or 0)
-        read_t = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
-        write_t = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-        _emit_usage(on_event, in_t, out_t, read_t, write_t, actual_cost(model, in_t, out_t, read_t, write_t))
+        in_t, out_t, read_t, write_t = _usage_ints(usage)
+        meter.settle(on_event, in_t, out_t, read_t, write_t, actual_cost(model, in_t, out_t, read_t, write_t))
 
     stop_reason = str(getattr(message, "stop_reason", "") or "")
     if stop_reason == "refusal":

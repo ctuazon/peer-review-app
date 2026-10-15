@@ -1408,8 +1408,11 @@ class PeerReviewApp(PromptsTabMixin, HistoryTabMixin, tk.Tk):
         self._update_usage_label()
 
     def _record_usage(self, event: dict) -> None:
+        """Events carry increments; new_call starts the "last call" count over."""
         try:
-            input_tokens = int(event.get("input_tokens") or 0)
+            # Cache writes are fresh input too (billed at a premium); only
+            # cache reads are tracked apart, for the footer's cache %.
+            input_tokens = int(event.get("input_tokens") or 0) + int(event.get("cache_write_tokens") or 0)
             output_tokens = int(event.get("output_tokens") or 0)
         except (TypeError, ValueError):
             return
@@ -1418,7 +1421,8 @@ class PeerReviewApp(PromptsTabMixin, HistoryTabMixin, tk.Tk):
             cost = float(event["cost_usd"]) if event.get("cost_usd") else 0.0
         except (TypeError, ValueError):
             cache_read, cost = 0, 0.0
-        self._call_usage = (input_tokens, output_tokens)
+        call_in, call_out = (0, 0) if event.get("new_call") else self._call_usage
+        self._call_usage = (call_in + input_tokens, call_out + output_tokens)
         self._job_usage["input"] += input_tokens
         self._job_usage["output"] += output_tokens
         self._job_usage["cache_read"] = self._job_usage.get("cache_read", 0) + cache_read
